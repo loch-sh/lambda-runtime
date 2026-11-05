@@ -1,0 +1,10 @@
+loch lambda-runtime
+Copyright 2026 The Loch.sh Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It implements the publicly documented AWS Lambda Runtime API (2018-06-01)
+and the AWS Lambda Invoke API. It contains no code from the AWS Lambda
+Runtime Interface Emulator. "AWS" and "AWS Lambda" are trademarks of
+Amazon.com, Inc. or its affiliates; this project is not affiliated with
+or endorsed by Amazon.

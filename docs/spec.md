@@ -1,0 +1,127 @@
+# loch lambda-runtime — specification v1 (draft 3, 2026-11-06)
+
+Draft 3 integrates two reviews: security (**[sec]**) and AWS compatibility (**[aws]**, checked against the AWS docs, the botocore model, the RIE at commit d71cae7 and the Node/Python RICs read in the images; copies in `scratchpad/review-ric/` and `scratchpad/review-src/`). Items marked *(unverified)* match the RIE formatter but were not seen on a live AWS response: clients must match on `errorType`, not on messages.
+
+Canonical spec for the `loch/lambda-runtime` project. Context: `host-panel-api/docs/design/services-decisions.md` §20 (functions module of Loch.sh Panel), spike results in `scratchpad/fn-spike/`.
+
+## Product constraints
+
+- Main principle: open-source infrastructure, **no vendor lock-in**, based on Docker. The binary knows neither the panel nor loch: it implements AWS's public protocols and is usable standalone.
+- **AWS Lambda compatible with minimal adjustments**: existing Lambda functions and Lambda container images run almost unchanged (Runtime API `2018-06-01`, `AWS_LAMBDA_*` variables, AWS base images, AWS event formats, AWS Invoke API).
+- Go (latest stable), Apache-2.0 (`LICENSE`, `NOTICE`), up-to-date dependencies, stdlib preferred. Code, README, messages in English.
+
+## Why
+
+The Runtime Interface Emulator (RIE) bundled in AWS base images crashes on two overlapping invocations (`ReserveFailed: AlreadyReserved` then nil pointer panic in `rapidcore/server.go:666`, exit 2, every in-flight request lost; upstream v1.35 too). It also invokes the function on any HTTP method, answers 200 on timeouts and exceptions without a reliable marker, and silently truncates bodies over 6 MiB. The RIE (Apache-2.0) is a behaviour reference; its code is not copied.
+
+## Deliverable
+
+- Static Go binary `loch-lambda-runtime` (name to confirm), `CGO_ENABLED=0`, linux/amd64 and linux/arm64.
+- Subcommands: (default) run, `health`, `version`, `invoke` (see "Local invoke").
+- **[sec] Release hygiene**: reproducible build (`-trimpath`, `CGO_ENABLED=0`, pinned toolchain, `-buildid=`), binaries + `SHA256SUMS` with a detached signature (minisign or cosign keyless; public key/identity published in the README and embedded in Loch.sh Panel), SBOM per release. The trust root on the panel side is the panel build (embedded hash table and public key), never a bare `SHA256SUMS`.
+
+## Process model (the binary is PID 1, the container entrypoint)
+
+- Command line: `loch-lambda-runtime [flags] -- <original ENTRYPOINT...> <original CMD...>`. Shortcut: a single argument without `--` (`index.handler`) means `/lambda-entrypoint.sh index.handler`. The panel copies the image's ENTRYPOINT/CMD (`docker image inspect`), so any Lambda image works: the AWS base images (nodejs, python, provided.al2023, java, dotnet, ruby share `ENTRYPOINT ["/lambda-entrypoint.sh"]`, `WORKDIR /var/task`) and images using `awslambdaric` / `aws-lambda-ric` as entrypoint.
+- **[aws]** `/lambda-entrypoint.sh` exits 142 unless it gets exactly one argument, and the image CMD is `null`: the handler must always be supplied. The child runs with `Dir` = the image WORKDIR (by default the runtime's own working directory, which Docker sets to the image WORKDIR, `/var/task` in the AWS images; flag `--workdir` / `LOCH_RUNTIME_WORKDIR`): relative entrypoints such as `./main` on provided.al2023 resolve against it.
+- Compose example: `entrypoint: ["/loch/lambda-runtime"]`, `command: ["--", "/lambda-entrypoint.sh", "index.handler"]`, binary mounted read-only at `/loch/lambda-runtime` (not `/opt`: Lambda layers; the bootstraps put `/opt/nodejs`, `/opt/python`, `/opt/lib` on their search paths).
+- Starts the Runtime API on `127.0.0.1:9001` (loopback only), then runs the child. Verified in Node 22 and Python 3.13: `/lambda-entrypoint.sh` exports `_HANDLER="$1"`, execs the RIE when `AWS_LAMBDA_RUNTIME_API` is empty, `/var/runtime/bootstrap` otherwise.
+- **[aws] Environment of the child** (the rest is passed through unchanged):
+  - always forced: `AWS_LAMBDA_RUNTIME_API=127.0.0.1:9001` (IPv4 `host:port`: the Node RIC splits on `:`), overriding any image or user value;
+  - always removed, with a warning: `AWS_LAMBDA_MAX_CONCURRENCY` (it switches the Node bootstrap to `/var/runtime/mc/index.mjs`, Python to `LambdaMultiConcurrentRuntimeClient`, and contradicts one invocation in flight);
+  - always removed, silently: every `LOCH_RUNTIME_*` variable (the runtime's own settings, which locate the Invoke credentials);
+  - set when absent: `AWS_LAMBDA_FUNCTION_NAME` (default `function`), `AWS_LAMBDA_FUNCTION_VERSION=$LATEST`, `AWS_LAMBDA_FUNCTION_MEMORY_SIZE`, `AWS_LAMBDA_LOG_GROUP_NAME=/aws/lambda/<name>`, `AWS_LAMBDA_LOG_STREAM_NAME=YYYY/MM/DD/[$LATEST]<32 hex>`, `AWS_REGION` (default `us-east-1`), `AWS_DEFAULT_REGION` (= region), `AWS_LAMBDA_INITIALIZATION_TYPE=on-demand`, `AWS_XRAY_CONTEXT_MISSING=LOG_ERROR`, `LAMBDA_TASK_ROOT=/var/task`, `LAMBDA_RUNTIME_DIR=/var/runtime`;
+  - never set: `AWS_EXECUTION_ENV` (the AWS bootstraps export it) and credentials: the runtime never invents `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, they come from the caller's environment (the panel's secrets).
+- `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` absent: derived from `/sys/fs/cgroup/memory.max` (cgroup v2) and logged; `max` (no limit) → 3008, as the RIE (the Node bootstrap derives `--max-old-space-size` from it: 231 for 256).
+- `AWS_LAMBDA_FUNCTION_TIMEOUT` (seconds, default 300 like the RIE) is an RIE convention, not a documented Lambda variable: kept, and documented as such.
+- PID 1 duties: reap zombies, child in its own process group, child started with `oom_score_adj=1000` (no privilege needed) so the kernel OOM-kills the bootstrap rather than PID 1. **[aws]** SIGTERM: stop accepting (queued requests get 503 + `Retry-After`), let the running invocation finish within `LOCH_RUNTIME_SHUTDOWN_GRACE`, then SIGTERM the group, then SIGKILL after ~500 ms. `LOCH_RUNTIME_SHUTDOWN_GRACE` must be shorter than the compose `stop_grace_period` (the panel sets both).
+- **Init** at startup (not lazily), so health reflects reality. **[aws]** As on Lambda, an init longer than `LOCH_RUNTIME_INIT_TIMEOUT` (10 s) is not fatal: init keeps running and its time is charged to the first invocation's timeout ("suppressed init"); if that expires the answer is `Sandbox.Timedout`, not `Runtime.InitError`. A posted `/init/error` (the RICs then exit: Node 128/129, Python 1) → the invocations that were waiting get that error; re-init with capped backoff; a crash loop keeps `error` in health (Docker `unhealthy`) and is counted in the metrics.
+- **[aws]** An exit while idle (between invocations) → re-init before the next `next`, not an error state.
+
+## Invocation API (`0.0.0.0:8080`), AWS Invoke compatible
+
+- `POST /2015-03-31/functions/{name}/invocations`. **[aws]** `{name}` (URL-decoded) = `function`, `AWS_LAMBDA_FUNCTION_NAME`, `<name>:$LATEST`, or a full/partial ARN of it; `?Qualifier=` absent or `$LATEST`; anything else → 404 `ResourceNotFoundException`. Same path as the RIE, so `aws lambda invoke --endpoint-url`, SAM and SDKs work. Any other method → 405, never invokes.
+- One endpoint for every network caller: other sites or functions on the function's private networks (SDK with `endpoint-url`), later the Loch S3 webhook. The panel uses "Local invoke".
+- **[sec] Authentication is required** unless `LOCH_RUNTIME_AUTH=off` (standalone/dev only, warning at startup). Private networks are not an access control (any container can join by name), and an unauthenticated caller could forge an S3 event and make the function use its own credentials on another object (confused deputy). Two accepted credentials, checked **before the body is read** (401 missing, 403 wrong, constant-time comparison), errors in the AWS shape below:
+  - a bearer token (`Authorization: Bearer <token>`) read from `LOCH_RUNTIME_TOKEN_FILE`;
+  - AWS SigV4 (service `lambda`, any region) with a static key pair read from `LOCH_RUNTIME_ACCESS_KEY_FILE` (`<access key id>:<secret>`), so AWS SDK callers with `endpoint-url` work unchanged. Clock skew ±5 min, `X-Amz-Content-Sha256` / payload hash verified when present.
+  - Each credential comes from an environment variable (`LOCH_RUNTIME_TOKEN`, `LOCH_RUNTIME_ACCESS_KEY`) or from its `*_FILE`, never both (configuration error). The variables are read at startup, then removed from the runtime's own environment (`os.Unsetenv`) and never passed to the child; the runtime makes itself non-dumpable (`PR_SET_DUMPABLE=0`) so a child running under the same uid cannot read `/proc/1/environ` or `/proc/1/mem`. Files are read once at startup (re-read on SIGHUP), never logged; non-empty, ≥ 32 bytes for the token. The panel passes the variables through a 0400 `env_file`, masked in inspect.
+  - Scope of this protection: function code that reads the token gains nothing it does not already have (it is the code being invoked, and it holds its own credentials). The point is to keep a compromised dependency from exfiltrating the token to call the function later from the network. It is defence in depth, not a strong boundary: same uid, same container. A `*_FILE` is readable by the child.
+- `/_loch/health` stays open; `/_loch/metrics` and `X-Amz-Log-Type: Tail` require the credential.
+- **[sec] HTTP server limits**: `ReadHeaderTimeout` 5 s, `IdleTimeout` 30 s, `MaxHeaderBytes` 32 KiB, body read deadline with a minimum rate (anti-slowloris), connection cap `LOCH_RUNTIME_MAX_CONNS` (default 64).
+- Body: raw event, limit `LOCH_RUNTIME_MAX_PAYLOAD` (6 MiB). Over → 413 `RequestTooLargeException` **[aws]**, never a truncated body; a `Content-Length` over the limit is refused before reading; chunked bodies are counted. Empty body → `{}` is NOT invented: it is passed as is (both RICs then fail with an unmarshal error, which is the function's answer) *(real Lambda behaviour unverified)*.
+- Headers:
+  - `X-Amz-Invocation-Type`: `RequestResponse` (default), `DryRun` → 204, `Event` → 400 `InvalidParameterValueException` in v1 (202 on real Lambda: a stated deviation);
+  - `X-Amz-Client-Context` **[aws]**: base64, ≤ 3,583 bytes, decoded and checked to be a JSON object (else 400 `InvalidRequestContentException`), relayed decoded as `Lambda-Runtime-Client-Context`;
+  - `X-Amz-Log-Type: Tail` → `X-Amz-Log-Result` = base64 of the last 4096 bytes of this invocation's logs, START to REPORT included;
+  - `X-Amzn-RequestId`, when a valid UUID, is used as the request id (as the RIE), so callers can correlate; `X-Amzn-Trace-Id`, when valid, becomes the trace id.
+- **[aws] Errors of the Invoke API itself** (not function errors) use the AWS rest-json shape: header `x-amzn-ErrorType: <Name>`, `x-amzn-RequestId`, body `{"Type":"User","message":"…"}`. Codes: 413 `RequestTooLargeException`; 429 `TooManyRequestsException` + `Retry-After` + `"Reason":"ReservedFunctionConcurrentInvocationLimitExceeded"` (AWS SDKs retry it by themselves); 404 `ResourceNotFoundException`; 400 `InvalidRequestContentException` / `InvalidParameterValueException`; 401/403 for authentication; 405 for other methods; 503 `ServiceException` on shutdown.
+- **Function results**: the HTTP status is the delivery (200). Always `x-amzn-RequestId` **[aws]** (= `Lambda-Runtime-Aws-Request-Id`), `X-Amz-Executed-Version: $LATEST`, `Content-Type`.
+  - success: payload as posted by the runtime;
+  - function error: `X-Amz-Function-Error: Unhandled` + the body the runtime posted, verbatim;
+  - **[aws] precedence, first match wins**: posted init error > posted response or error > response too large > timeout > OOM > exit. Bodies:
+    - init error: the body the runtime posted to `/init/error` (e.g. `Runtime.ImportModuleError`, `Runtime.HandlerNotFound`), fallback `Runtime.ExitError` below;
+    - response too large: limit 6,291,556 bytes (6 MiB + 100, `interop.MaxPayloadSize` in the RIE); the runtime gets 413 `{"errorMessage":"Exceeded maximum allowed payload size (6291556 bytes).","errorType":"RequestEntityTooLarge"}`, the invoker gets `{"errorType":"Function.ResponseSizeTooLarge","errorMessage":"Response payload size exceeded maximum allowed payload size (6291556 bytes)."}` *(message unverified)*, then re-init (Python dies on the 413);
+    - timeout: `{"errorType":"Sandbox.Timedout","errorMessage":"RequestId: <id> Error: Task timed out after 3.00 seconds"}` (configured timeout, 2 decimals) *(prefix unverified)*, SIGKILL of the group, re-init before the next one;
+    - OOM (`memory.events` `oom_kill` delta during the invocation + SIGKILL): `{"errorType":"Runtime.OutOfMemory","errorMessage":"RequestId: <id> Error: Runtime exited with error: signal: killed"}` *(message unverified)*, re-init;
+    - exit: `{"errorType":"Runtime.ExitError","errorMessage":"RequestId: <id> Error: Runtime exited with error: exit status N"}` (signals written `signal: <name>`, as observed in the spike), re-init.
+- **Concurrency**: exactly ONE invocation in flight to the bootstrap (Lambda model). FIFO queue bounded by count `LOCH_RUNTIME_QUEUE_SIZE` (default 16) **and by bytes [sec]** `LOCH_RUNTIME_QUEUE_BYTES` (default `min(32 MiB, memory/8)`, never below one maximum payload, at most 64 GiB, effective value logged at startup: queued bodies live in the function's own cgroup); either full → 429; configurable max wait → 429; client gone while queued → removed; client gone while running → finish, drop the result. **[aws]** Queue wait does not consume the function timeout: `Lambda-Runtime-Deadline-Ms` is computed when `next` returns the invocation.
+- Health: `GET /_loch/health` → 200 `{"status":"ready",…}` / 503 `initializing|error`, queue depth; never invokes. `health` subcommand queries it, exit 0/1 (compose healthcheck `["CMD","/loch/lambda-runtime","health"]`, no curl).
+
+## Local invoke **[sec]**
+
+`loch-lambda-runtime invoke [--timeout <s>] [--log-tail]` reads the event on stdin (max 6 MiB), invokes `127.0.0.1:8080` with the configured credential, and writes one bounded JSON envelope on stdout: `{"statusCode":…,"functionError":…,"requestId":…,"durationMs":…,"payload":"<base64>","logTail":"<base64>"}`. Exit 0 = delivered (whatever the function result), non-zero = transport error. The panel uses it through `docker exec`, so it never joins a function network (no bridge, no DNS impostor, no exposure of the panel API to tenants).
+
+## Runtime API (`127.0.0.1:9001`), version 2018-06-01 per AWS docs
+
+- `GET /2018-06-01/runtime/invocation/next` (long-poll) → 200 with the event and:
+  - `Lambda-Runtime-Aws-Request-Id`, `Lambda-Runtime-Deadline-Ms` (epoch ms), `Lambda-Runtime-Invoked-Function-Arn` = `arn:aws:lambda:<AWS_REGION>:000000000000:function:<name>` **[aws]** (functions parse the account id from field 4);
+  - `Lambda-Runtime-Trace-Id` always, valid X-Ray form `Root=1-<8 hex epoch>-<24 hex>;Parent=<16 hex>;Sampled=0` or the incoming `X-Amzn-Trace-Id` (both RICs copy it to `_X_AMZN_TRACE_ID`, parsed by the X-Ray SDK and Powertools);
+  - `Lambda-Runtime-Client-Context` and `Lambda-Runtime-Cognito-Identity` **only when non-empty** **[aws]** (the Node RIC `JSON.parse`s them whenever present);
+  - `Lambda-Runtime-Invocation-Id` is not sent in v1 (stated deviation; it is optional);
+  - optionally `Lambda-Runtime-Aws-Tenant-Id` from `X-Amz-Tenant-Id` (low priority).
+- `POST …/invocation/{id}/response` (limit 6,291,556 bytes) and `POST …/invocation/{id}/error` → 202 `{"status":"OK"}`; `POST …/runtime/init/error` → 202.
+- **[aws] Error type** = `Lambda-Runtime-Function-Error-Type` if present, otherwise the body's `errorType`, otherwise `Runtime.Unknown`. The Node and Python RICs post invocation errors through aws-lambda-cpp, which never sends that header (only `/init/error` does): the type is in the body (`{"errorType","errorMessage","trace"}` Node, `{"errorMessage","errorType","requestId","stackTrace"}` Python). `Lambda-Runtime-Function-XRay-Error-Cause` is accepted and ignored.
+- **[aws] Response streaming accepted in buffered mode**: `/response` with `Lambda-Runtime-Function-Response-Mode: streaming` and chunked encoding (Node `streamifyResponse` handlers) is buffered up to the limit; error trailers (`Lambda-Runtime-Function-Error-Type`, `Lambda-Runtime-Function-Error-Body` base64) become the function error. Streaming to the client stays out of scope (real Lambda also buffers through the plain Invoke API).
+- **[aws] Server limits on :9001**: no read, write or idle timeout on `next` (AWS: "do not set a timeout on the GET request"; the Node RIC keeps one keep-alive socket); `MaxHeaderBytes` ≥ 2 MiB (Python caps the X-Ray cause header just below 1 MiB, Node has no cap); keep-alive.
+- Real state machine: unknown/stale id, double response, concurrent `next` → clean 4xx, NEVER a panic. **[aws]** Any non-2xx answer is fatal for the Python RIC (it raises and exits): every such path is followed by the exit / re-init handling above.
+- **[aws] Unknown routes** → clean 404: `/2020-01-01/extension/*`, `/2022-07-01/telemetry`, `/2020-08-15/logs`, `/2018-06-01/runtime/restore/next` ("SnapStart is not enabled"). `/opt/extensions` is never launched: a layer extension silently does nothing (documented). `AWS_LAMBDA_EXEC_WRAPPER` keeps working (handled by the bootstraps).
+- Out of scope v1: Extensions and Telemetry APIs, streaming to the client, SnapStart, X-Ray export, async `Event`.
+
+## Logs and metrics
+
+- Child stdout/stderr relayed unbuffered to the container output.
+- **[aws] Platform lines in Lambda's plain-text format** (tab-separated): `START RequestId: <id> Version: $LATEST`, `END RequestId: <id>`, `REPORT RequestId: <id>\tDuration: X ms\tBilled Duration: Y ms\tMemory Size: M MB\tMax Memory Used: N MB\t` (`memory.peak` when available), `Init Duration: Z ms\t` on the first REPORT after an init, on failure `Status: timeout` or `Status: error\tError Type: <type>` *(unverified)*; optional `INIT_START Runtime Version: …`. With `AWS_LAMBDA_LOG_FORMAT=JSON` the platform lines become `{"time","type":"platform.start|platform.report|platform.initStart","record":{…}}` (the RICs already format application logs from the passed-through variable).
+- The runtime's own logs: JSON (slog) on stderr, never interleaved inside an invocation's log tail. Never event contents or secrets.
+- `GET /_loch/metrics` (credential required), Prometheus text format: invocations by outcome (success, error, timeout, exit, oom, throttled, too_large), duration histogram, current/max queue depth, init count and duration, cgroup peak memory, state.
+
+## Container lifecycle (panel side, for information)
+
+- 1 container = 1 function = 1 runtime, created by compose, kept alive by Docker (`restart: unless-stopped`). Always warm, no scale-to-zero in v1; cold start (~200 ms measured, init included) only at deploy, restart, or after a timeout/crash (re-init).
+- Scaling later = replicas on the panel side; replicas are independent.
+- Memory: compose `mem_limit` = `memswap_limit`, `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` set to the same value.
+
+## Deployment (panel side, for information)
+
+- v1: zip + AWS base image (Node.js, Python). The panel validates and extracts the zip into a versioned directory mounted read-only at `/var/task`; the runtime never handles a zip.
+- Later: client Lambda container images (hence the `--` requirement, needed from v1).
+- The runtime binary is mounted read-only, pinned by sha256 in the panel's private reference, never part of the image.
+- Image source does not matter to the runtime: both `public.ecr.aws/lambda/*` (multi-arch) and `mirror.gcr.io/amazon/aws-lambda-*` (arch-suffixed tags `nodejs:{22,24,26}-{arm64,x86_64}`, `python:{3.12,3.13,3.14}-{arm64,x86_64}`; plain tags frozen since 2025-01 and amd64 only; first pulls may answer not found / 429, retry) must work.
+- **[aws]** `/tmp`: Lambda gives 512 MB by default, and "download the object to /tmp" is a common pattern; the panel makes the tmpfs size configurable (default 512 MB, documented as counted against the memory limit).
+- **[aws] AWS SDK use**: functions calling AWS-compatible services (Loch S3) get `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from panel secrets and `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` (standard SDK variables), so the code is unchanged; the panel sets `AWS_EC2_METADATA_DISABLED=true` (otherwise the SDK credential chain times out on IMDS). Later: an ECS-style container-credentials endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN`) for rotating keys. Open: S3 virtual-hosted-style addressing does not resolve on Docker DNS; check path-style defaults with Loch S3 in phase 1b.
+
+## Hardening (validated in the spike with the RIE, must hold)
+
+Arbitrary non-root uid (10001:10001), `read_only`, `cap_drop: ALL`, `no-new-privileges`, only `/tmp` writable (tmpfs), memory limit without swap, `cpus` 0.5, `pids_limit` 128, `internal` network, no published port. The binary writes nothing outside `/tmp`, depends on neither the image's libc nor curl. OOM detection reads `memory.events` from the container's own cgroup (read-only): verify it is visible under the hardening.
+
+## How Loch.sh Panel uses it
+
+- Downloads the release for the host arch, verifies it against the hash table and public key embedded in the panel build, stores it in `FUNCTIONS_DATA_DIRECTORY/.runtime/<version>/<arch>/`, pins the sha256 in `function.json`, checks `version`.
+- Invokes with `docker exec <fn> /loch/lambda-runtime invoke --log-tail` (bounded stdin/stdout, deadline = function timeout + queue wait + margin), never through a network bridge. Network callers (other sites, the Loch S3 outbox) use the HTTP endpoint with the token or SigV4 key pair the panel generated for that function. The panel treats the envelope as untrusted (fixed JSON envelope, never copies function headers or content types).
+- Generates per-function credentials (`.loch/fn-<name>/invoke.token`, access key pair), 0400, shown once, rotatable.
+- The Loch S3 webhook will authenticate with SigV4 or the bearer token like any caller; the Loch S3 side also signs the body (HMAC, timestamp, replay window).
+
+## Tests
+
+- Unit: Runtime API state machine (including double response, stale id, concurrent `next`, error type from body vs header, streaming mode with trailers), queue (full, byte cap, disconnects, max wait, deadline computed at `next`), timeouts, outcome precedence, configuration parsing, environment building (forced/removed/defaulted variables), authentication (bearer, SigV4 valid/expired/wrong, missing), server limits (slow headers, slow body, oversized Content-Length, chunked), Invoke error shapes (`x-amzn-ErrorType`, body), function name/ARN/Qualifier matching, `invoke` subcommand envelope, log line formats (text and JSON).
+- Integration (build tag `integration`, Docker) against real AWS images from both registries, under the full hardening: 50 parallel invocations without a crash (each served or 429), timeout, exception (Node and Python bodies), `process.exit` / `os._exit`, init error (missing module, missing handler), slow init (> 10 s), payload 6 MiB + 1 → 413, oversized response, OOM, `streamifyResponse` handler, SIGTERM during an invocation, non-POST methods, healthcheck, `--` with `provided.al2023` (a Go `bootstrap`), an AWS SDK v3 call from Node with `endpoint-url` and SigV4 against the runtime (`aws lambda invoke`); bonus: sharp resize (spike `code-sharp/`).
