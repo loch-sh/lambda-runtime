@@ -7,16 +7,10 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"strings"
 	"sync/atomic"
 
 	"github.com/loch-sh/lambda-runtime/internal/config"
 )
-
-// maxCredentialFile bounds the size of a credential file.
-const maxCredentialFile = 4096
 
 // Credentials are the accepted credentials. Only the SHA-256 of the bearer
 // token is kept; an empty AccessKeyID disables SigV4.
@@ -97,30 +91,5 @@ func value(direct, file string) (string, error) {
 	if direct != "" || file == "" {
 		return direct, nil
 	}
-	// A regular file only: a FIFO would block the open, a device could be
-	// endless. Rotate a file by renaming a complete new one over it.
-	info, err := os.Stat(file)
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file", file)
-	}
-	f, err := os.Open(file)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, maxCredentialFile+1))
-	if err != nil {
-		return "", err
-	}
-	if len(b) > maxCredentialFile {
-		return "", fmt.Errorf("%s is larger than %d bytes", file, maxCredentialFile)
-	}
-	v := strings.TrimSpace(string(b))
-	if v == "" {
-		return "", fmt.Errorf("%s is empty", file)
-	}
-	return v, nil
+	return readCredentialFile(file)
 }

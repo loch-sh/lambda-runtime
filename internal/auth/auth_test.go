@@ -9,7 +9,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -242,16 +241,10 @@ func TestMethodNotConfigured(t *testing.T) {
 }
 
 func TestStoreFilesAndReload(t *testing.T) {
+	trustFiles(t)
 	dir := t.TempDir()
-	tokenFile := filepath.Join(dir, "token")
-	keyFile := filepath.Join(dir, "key")
-	write := func(path, v string) {
-		if err := os.WriteFile(path, []byte(v), 0o400); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write(tokenFile, testToken+"\n")
-	write(keyFile, testKeyID+":"+testSecret+"\n")
+	tokenFile := writeFile(t, dir, "token", testToken+"\n")
+	keyFile := writeFile(t, dir, "key", testKeyID+":"+testSecret+"\n")
 	s, err := NewStore(config.Auth{Enabled: true, TokenFile: tokenFile, AccessKeyFile: keyFile})
 	if err != nil {
 		t.Fatal(err)
@@ -261,30 +254,25 @@ func TestStoreFilesAndReload(t *testing.T) {
 		t.Errorf("credentials = %+v", c)
 	}
 	// Rotation: new token on reload.
-	_ = os.Remove(tokenFile)
-	write(tokenFile, strings.Repeat("z", 40))
+	writeFile(t, dir, "token", strings.Repeat("z", 40))
 	if err := s.Reload(); err != nil || s.Current().TokenSHA256 != sha256.Sum256([]byte(strings.Repeat("z", 40))) {
 		t.Errorf("reload: %v %+v", err, s.Current())
 	}
 	// A broken file keeps the credentials in force.
-	_ = os.Remove(tokenFile)
-	write(tokenFile, "short")
+	writeFile(t, dir, "token", "short")
 	if err := s.Reload(); err == nil || s.Current().TokenSHA256 != sha256.Sum256([]byte(strings.Repeat("z", 40))) {
 		t.Errorf("broken reload: %v %+v", err, s.Current())
 	}
 }
 
 func TestStoreErrors(t *testing.T) {
+	trustFiles(t)
 	dir := t.TempDir()
-	empty := filepath.Join(dir, "empty")
-	big := filepath.Join(dir, "big")
-	_ = os.WriteFile(empty, []byte("  \n"), 0o400)
-	_ = os.WriteFile(big, []byte(strings.Repeat("x", maxCredentialFile+1)), 0o400)
 	for name, cfg := range map[string]config.Auth{
 		"missing file": {TokenFile: filepath.Join(dir, "nope")},
 		"directory":    {TokenFile: dir},
-		"empty file":   {TokenFile: empty},
-		"big file":     {AccessKeyFile: big},
+		"empty file":   {TokenFile: writeFile(t, dir, "empty", "  \n")},
+		"big file":     {AccessKeyFile: writeFile(t, dir, "big", strings.Repeat("x", maxCredentialFile+1))},
 		"bad key":      {AccessKey: "nocolon"},
 		"nothing":      {},
 	} {
@@ -343,12 +331,10 @@ func TestCanonicalQueryOrder(t *testing.T) {
 }
 
 func TestBearerByHash(t *testing.T) {
+	trustFiles(t)
 	sum := sha256.Sum256([]byte(testToken))
 	dir := t.TempDir()
-	hashFile := filepath.Join(dir, "token.sha256")
-	if err := os.WriteFile(hashFile, []byte(hex.EncodeToString(sum[:])+"\n"), 0o400); err != nil {
-		t.Fatal(err)
-	}
+	hashFile := writeFile(t, dir, "token.sha256", hex.EncodeToString(sum[:])+"\n")
 	for name, cfg := range map[string]config.Auth{
 		"env":  {Enabled: true, TokenSHA256: hex.EncodeToString(sum[:])},
 		"file": {Enabled: true, TokenSHA256File: hashFile},
@@ -363,9 +349,7 @@ func TestBearerByHash(t *testing.T) {
 		_, err := a.Authenticate(r)
 		wantAuthError(t, err, 403, "UnrecognizedClientException")
 	}
-	bad := filepath.Join(dir, "bad")
-	_ = os.WriteFile(bad, []byte("nothex"), 0o400)
-	if _, err := NewStore(config.Auth{TokenSHA256File: bad}); err == nil {
+	if _, err := NewStore(config.Auth{TokenSHA256File: writeFile(t, dir, "bad", "nothex")}); err == nil {
 		t.Error("invalid hash file accepted")
 	}
 }

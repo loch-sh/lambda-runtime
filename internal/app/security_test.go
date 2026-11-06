@@ -29,8 +29,8 @@ func TestHardenFailureIsFatalWithEnvCredentials(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 	// With file credentials (or none), it is only a warning.
-	file := filepath.Join(t.TempDir(), "token")
-	_ = os.WriteFile(file, []byte(securityToken), 0o400)
+	t.Cleanup(auth.TrustFilesForTests())
+	file := writeToken(t, t.TempDir(), securityToken)
 	cfg.Runtime.Auth = config.Auth{Enabled: true, TokenFile: file}
 	if store, a, err := secure(cfg, refused, slog.New(slog.DiscardHandler)); err != nil || store == nil || a == nil {
 		t.Errorf("file credentials: %v", err)
@@ -50,14 +50,9 @@ func TestSecretEnvCleared(t *testing.T) {
 }
 
 func TestReloadLoop(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "token")
-	write := func(v string) {
-		_ = os.Remove(file)
-		if err := os.WriteFile(file, []byte(v), 0o400); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write(securityToken)
+	t.Cleanup(auth.TrustFilesForTests())
+	dir := t.TempDir()
+	file := writeToken(t, dir, securityToken)
 	store, err := auth.NewStore(config.Auth{Enabled: true, TokenFile: file})
 	if err != nil {
 		t.Fatal(err)
@@ -70,11 +65,11 @@ func TestReloadLoop(t *testing.T) {
 	go func() { reloadLoop(signals, done, store, log); close(finished) }()
 
 	rotated := strings.Repeat("r", 40)
-	write(rotated)
+	writeToken(t, dir, rotated)
 	signals <- syscall.SIGHUP
 	waitUntil(t, func() bool { return store.Current().TokenSHA256 == sha256.Sum256([]byte(rotated)) })
 
-	write("short") // broken: the rotated token stays
+	writeToken(t, dir, "short") // broken: the rotated token stays
 	signals <- syscall.SIGHUP
 	waitUntil(t, func() bool { return strings.Contains(logs.String(), "not reloaded") })
 	if store.Current().TokenSHA256 != sha256.Sum256([]byte(rotated)) {
@@ -102,4 +97,18 @@ func waitUntil(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// writeToken replaces dir/token with a file holding v (renamed over the old
+// one, as a rotation does) and returns its path.
+func writeToken(t *testing.T, dir, v string) string {
+	t.Helper()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path+".new", []byte(v), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path+".new", path); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

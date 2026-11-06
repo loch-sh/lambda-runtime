@@ -171,6 +171,14 @@ that fails keeps the credentials in force, so writing an invalid credential
 revokes nothing: to revoke, restart with new credentials. One source per
 credential. Generate the access key id at random and keep it private too.
 
+Mount the credential files read-only (Docker secrets, or a `:ro` bind
+mount). The function runs under the runtime's user and can send it SIGHUP,
+so the runtime refuses a credential file that this user could change: the
+file and every directory above it must be on a read-only mount, or belong
+to another user without being writable by the runtime. A world-writable
+file is refused too. Run the runtime as a non-root user (the image uses
+uid 10001): as root, the whole path, rootfs included, must be read-only.
+
 SigV4 requests can be replayed within the ±5 min clock skew, and the Invoke
 API is plain HTTP: expose it on private networks only.
 
