@@ -20,6 +20,7 @@ type setting struct{ flag, env, help string }
 var settings = []setting{
 	{"invoke-addr", "LOCH_RUNTIME_INVOKE_ADDR", "listen address of the Invoke API"},
 	{"runtime-api-addr", "LOCH_RUNTIME_API_ADDR", "loopback listen address of the Runtime API"},
+	{"health-addr", "LOCH_RUNTIME_HEALTH_ADDR", "loopback listen address of the health endpoint used by the health subcommand"},
 	{"bootstrap", "LOCH_RUNTIME_BOOTSTRAP", "program run with the handler in the shortcut form"},
 	{"workdir", "LOCH_RUNTIME_WORKDIR", "working directory of the child (default: the current one, i.e. the image WORKDIR)"},
 	{"init-timeout", "LOCH_RUNTIME_INIT_TIMEOUT", "maximum init duration (Go duration or seconds)"},

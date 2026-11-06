@@ -13,7 +13,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
+
+	"github.com/loch-sh/lambda-runtime/internal/cgroup"
 )
 
 // Command is the subcommand selected on the command line.
@@ -90,7 +93,7 @@ type Sources struct {
 func DefaultSources() Sources {
 	return Sources{
 		Env:             OSEnv{},
-		CgroupMemoryMax: "/sys/fs/cgroup/memory.max",
+		CgroupMemoryMax: filepath.Join(cgroup.Resolve(cgroup.DefaultRoot, cgroup.SelfCgroupFile), "memory.max"),
 		Now:             time.Now,
 		Output:          os.Stderr,
 	}

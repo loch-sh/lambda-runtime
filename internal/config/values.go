@@ -31,7 +31,7 @@ func validateAddr(addr string, loopbackOnly bool) error {
 	ip, err := netip.ParseAddr(host)
 	switch {
 	case loopbackOnly && (err != nil || !ip.Is4() || !ip.IsLoopback()):
-		return fmt.Errorf("%q: the Runtime API must listen on a loopback IPv4 address", addr)
+		return fmt.Errorf("%q: must be a loopback IPv4 address", addr)
 	case err != nil:
 		return fmt.Errorf("%q: host must be an IP address", addr)
 	}

@@ -17,6 +17,7 @@ import (
 const (
 	DefaultInvokeAddr     = "0.0.0.0:8080"
 	DefaultRuntimeAPIAddr = "127.0.0.1:9001"
+	DefaultHealthAddr     = "127.0.0.1:8081"
 	DefaultBootstrap      = "/lambda-entrypoint.sh"
 	DefaultInitTimeout    = 10 * time.Second
 	DefaultShutdownGrace  = 8 * time.Second
@@ -46,7 +47,10 @@ const (
 type Runtime struct {
 	InvokeAddr     string
 	RuntimeAPIAddr string
-	Bootstrap      string
+	// HealthAddr serves /_loch/health alone, on the loopback, so that the
+	// healthcheck never competes with Invoke API clients for connections.
+	HealthAddr string
+	Bootstrap  string
 	// Workdir is the working directory of the child; "" keeps ours.
 	Workdir       string
 	InitTimeout   time.Duration
@@ -165,6 +169,7 @@ func parseRuntime(v rawValues, env Env, memoryMB int) (Runtime, []error) {
 	rt := Runtime{
 		InvokeAddr:     p.addr("LOCH_RUNTIME_INVOKE_ADDR", DefaultInvokeAddr, false),
 		RuntimeAPIAddr: p.addr("LOCH_RUNTIME_API_ADDR", DefaultRuntimeAPIAddr, true),
+		HealthAddr:     p.addr("LOCH_RUNTIME_HEALTH_ADDR", DefaultHealthAddr, true),
 		Bootstrap:      p.absPathOr("LOCH_RUNTIME_BOOTSTRAP", DefaultBootstrap),
 		Workdir:        p.absPath("LOCH_RUNTIME_WORKDIR"),
 		InitTimeout:    p.duration("LOCH_RUNTIME_INIT_TIMEOUT", DefaultInitTimeout, false),

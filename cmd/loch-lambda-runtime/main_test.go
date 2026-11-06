@@ -20,6 +20,7 @@ func TestRunExitCodes(t *testing.T) {
 		{[]string{"-h"}, 0, "", "usage:"},
 		{nil, 2, "", "missing handler"},
 		{[]string{"--nope"}, 2, "", "flag provided but not defined"},
+		{[]string{"invoke"}, 1, "", "not implemented yet"},
 	}
 	for _, c := range cases {
 		var out, errOut bytes.Buffer
@@ -29,5 +30,15 @@ func TestRunExitCodes(t *testing.T) {
 		if out.String() != c.stdout || !strings.Contains(errOut.String(), c.stderrPart) {
 			t.Errorf("%q: stdout = %q, stderr = %q", c.args, out.String(), errOut.String())
 		}
+	}
+}
+
+func TestHealthUnreachable(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := run([]string{"health", "--health-addr", "127.0.0.1:1"}, &out, &errOut); code != 1 {
+		t.Errorf("code = %d", code)
+	}
+	if !strings.Contains(out.String(), "unreachable") {
+		t.Errorf("stdout = %q", out.String())
 	}
 }

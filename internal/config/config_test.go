@@ -439,6 +439,7 @@ func TestEverySettingIsRead(t *testing.T) {
 	invalid := map[string]string{
 		"LOCH_RUNTIME_INVOKE_ADDR":     "nope",
 		"LOCH_RUNTIME_API_ADDR":        "nope",
+		"LOCH_RUNTIME_HEALTH_ADDR":     "0.0.0.0:8081",
 		"LOCH_RUNTIME_BOOTSTRAP":       "relative",
 		"LOCH_RUNTIME_WORKDIR":         "relative",
 		"LOCH_RUNTIME_INIT_TIMEOUT":    "nope",
@@ -584,6 +585,7 @@ func TestSettingsLandInTheirField(t *testing.T) {
 	values := map[string]string{
 		"invoke-addr":      "127.0.0.1:8081",
 		"runtime-api-addr": "127.0.0.2:9002",
+		"health-addr":      "127.0.0.3:8082",
 		"bootstrap":        "/b",
 		"workdir":          "/w",
 		"init-timeout":     "11",
@@ -601,7 +603,7 @@ func TestSettingsLandInTheirField(t *testing.T) {
 	check := func(t *testing.T, rt Runtime) {
 		t.Helper()
 		want := Runtime{
-			InvokeAddr: "127.0.0.1:8081", RuntimeAPIAddr: "127.0.0.2:9002", Bootstrap: "/b", Workdir: "/w",
+			InvokeAddr: "127.0.0.1:8081", RuntimeAPIAddr: "127.0.0.2:9002", HealthAddr: "127.0.0.3:8082", Bootstrap: "/b", Workdir: "/w",
 			InitTimeout: 11 * time.Second, ShutdownGrace: 12 * time.Second, MaxPayload: 2048, QueueSize: 13,
 			QueueBytes: 4096, QueueTimeout: 14 * time.Second, MaxConns: 15, LogLevel: "debug",
 			Auth: Auth{Enabled: false, TokenFile: "/t", AccessKeyFile: "/k"},

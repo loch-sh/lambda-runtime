@@ -58,6 +58,7 @@ setting.
 |---|---|---|
 | `LOCH_RUNTIME_INVOKE_ADDR` | `0.0.0.0:8080` | Invoke API listen address |
 | `LOCH_RUNTIME_API_ADDR` | `127.0.0.1:9001` | Runtime API listen address (loopback only) |
+| `LOCH_RUNTIME_HEALTH_ADDR` | `127.0.0.1:8081` | health-only listener used by `health` (loopback only) |
 | `LOCH_RUNTIME_BOOTSTRAP` | `/lambda-entrypoint.sh` | program of the `<handler>` shortcut |
 | `LOCH_RUNTIME_WORKDIR` | current directory (the image `WORKDIR`) | working directory of the bootstrap |
 | `LOCH_RUNTIME_INIT_TIMEOUT` | `10s` | init budget before it is charged to the first invocation |
@@ -68,7 +69,9 @@ setting.
 | `LOCH_RUNTIME_QUEUE_TIMEOUT` | `30s` | maximum wait in the queue |
 | `LOCH_RUNTIME_MAX_CONNS` | `64` | open connections to the Invoke API |
 | `LOCH_RUNTIME_AUTH` | `on` | `off` disables authentication (development only) |
+| `LOCH_RUNTIME_TOKEN` | | bearer token (read at startup, then removed from the environment) |
 | `LOCH_RUNTIME_TOKEN_FILE` | | file holding the bearer token |
+| `LOCH_RUNTIME_ACCESS_KEY` | | `<access key id>:<secret>` for SigV4 (removed from the environment once read) |
 | `LOCH_RUNTIME_ACCESS_KEY_FILE` | | file holding `<access key id>:<secret>` for SigV4 |
 | `LOCH_RUNTIME_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
@@ -85,7 +88,8 @@ The bootstrap receives the inherited environment, plus the variables a Lambda
 runtime expects when they are absent (`AWS_LAMBDA_LOG_GROUP_NAME`,
 `AWS_LAMBDA_LOG_STREAM_NAME`, `AWS_DEFAULT_REGION`, `LAMBDA_TASK_ROOT`, …).
 `AWS_LAMBDA_RUNTIME_API` is always forced to the Runtime API, and
-`AWS_LAMBDA_MAX_CONCURRENCY` is always removed. No credential is ever invented.
+`AWS_LAMBDA_MAX_CONCURRENCY` and every `LOCH_RUNTIME_*` variable are always
+removed. No credential is ever invented.
 
 ## Not supported (v1)
 

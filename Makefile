@@ -7,7 +7,7 @@ LDFLAGS := -s -w -buildid= -X main.version=$(VERSION)
 GOFLAGS := -trimpath
 DIST    := dist
 
-.PHONY: all build test cover vet lint release clean test-linux
+.PHONY: all build test cover vet lint release clean test-linux integration
 
 all: vet test build
 
@@ -28,6 +28,10 @@ cover:
 # Runs the unit tests on Linux (process groups, subreaper, /proc).
 test-linux:
 	docker run --rm -v "$(CURDIR)":/src -w /src golang:1.27.3 go test -race ./...
+
+# Runs the integration tests against the real AWS images (needs Docker).
+integration:
+	go test -tags integration -count=1 -timeout 15m -v ./integration/
 
 # Static, reproducible binaries for the release architectures.
 release: clean

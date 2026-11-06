@@ -17,7 +17,7 @@ const (
 	// maxKillRounds bounds KillDescendants against a fork bomb outrunning it.
 	maxKillRounds = 10
 	// killWait bounds the wait for the signalled processes to die, per round.
-	killWait = time.Second
+	killWait = 250 * time.Millisecond
 )
 
 // procInfo is what KillDescendants needs to know about a process.

@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/loch-sh/lambda-runtime/internal/app"
 	"github.com/loch-sh/lambda-runtime/internal/config"
 )
 
@@ -38,6 +39,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case config.CommandVersion:
 		fmt.Fprintln(stdout, version)
 		return 0
+	case config.CommandRun:
+		return app.Run(cfg, app.Env{Stdout: stdout, Stderr: stderr})
+	case config.CommandHealth:
+		return app.Health(cfg, stdout)
 	default:
 		fmt.Fprintf(stderr, "loch-lambda-runtime: %s is not implemented yet\n", cfg.Command)
 		return 1
