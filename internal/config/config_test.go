@@ -473,6 +473,7 @@ func TestEverySettingIsRead(t *testing.T) {
 		"LOCH_RUNTIME_QUEUE_TIMEOUT":     "nope",
 		"LOCH_RUNTIME_MAX_CONNS":         "nope",
 		"LOCH_RUNTIME_AUTH":              "nope",
+		"LOCH_RUNTIME_ALLOW_BROWSER":     "nope",
 		"LOCH_RUNTIME_TOKEN_FILE":        "relative",
 		"LOCH_RUNTIME_TOKEN_SHA256_FILE": "relative",
 		"LOCH_RUNTIME_ACCESS_KEY_FILE":   "relative",
@@ -623,6 +624,7 @@ func TestSettingsLandInTheirField(t *testing.T) {
 		"queue-timeout":     "14",
 		"max-conns":         "15",
 		"auth":              "off",
+		"allow-browser":     "true",
 		"token-file":        "/t",
 		"token-sha256-file": "/h",
 		"access-key-file":   "/k",
@@ -633,7 +635,7 @@ func TestSettingsLandInTheirField(t *testing.T) {
 		want := Runtime{
 			InvokeAddr: "127.0.0.1:8081", RuntimeAPIAddr: "127.0.0.2:9002", HealthAddr: "127.0.0.3:8082", Bootstrap: "/b", Workdir: "/w",
 			InitTimeout: 11 * time.Second, ShutdownGrace: 12 * time.Second, MaxPayload: 2048, QueueSize: 13,
-			QueueBytes: 4096, QueueTimeout: 14 * time.Second, MaxConns: 15, LogLevel: "debug",
+			QueueBytes: 4096, QueueTimeout: 14 * time.Second, MaxConns: 15, AllowBrowser: true, LogLevel: "debug",
 			Auth: Auth{Enabled: false, TokenFile: "/t", AccessKeyFile: "/k"},
 		}
 		if rt != want {
@@ -694,5 +696,20 @@ func TestTokenSHA256(t *testing.T) {
 	got, err := ParseTokenSHA256(sum)
 	if err != nil || got[0] != 0xab {
 		t.Errorf("parse = %x %v", got, err)
+	}
+}
+
+// TestSwitches: on/true and off/false, in any case; browsers refused by
+// default.
+func TestSwitches(t *testing.T) {
+	for v, want := range map[string]bool{"on": true, "TRUE": true, "true": true, "off": false, "False": false} {
+		cfg, err := Parse([]string{"h"}, sources(t, mapEnv{"LOCH_RUNTIME_ALLOW_BROWSER": v, "LOCH_RUNTIME_AUTH": "off"}, ""))
+		if err != nil || cfg.Runtime.AllowBrowser != want {
+			t.Errorf("%s: %v %v", v, cfg.Runtime.AllowBrowser, err)
+		}
+	}
+	cfg, err := Parse([]string{"h"}, sources(t, mapEnv{"LOCH_RUNTIME_AUTH": "false"}, ""))
+	if err != nil || cfg.Runtime.Auth.Enabled || cfg.Runtime.AllowBrowser {
+		t.Errorf("defaults: %+v %v", cfg.Runtime, err)
 	}
 }

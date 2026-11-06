@@ -64,6 +64,9 @@ type Options struct {
 	// and docker exec processes (invoke, health) can connect, and the
 	// function gains nothing by invoking itself.
 	LoopbackWithoutAuth bool
+	// AllowBrowser accepts requests sent by a web browser; they are refused
+	// otherwise (see fromBrowser).
+	AllowBrowser bool
 	// Observer and Metrics may be nil.
 	Observer Observer
 	Metrics  MetricsWriter
@@ -77,8 +80,9 @@ type Handler struct {
 	opts  Options
 	mux   *http.ServeMux
 	perIP *ipLimiter
-	// authLog limits the logs of authentication failures.
-	authLog *logLimiter
+	// authLog and browserRefusalLog limit the logs of authentication
+	// failures and of refused browser requests.
+	authLog, browserRefusalLog *logLimiter
 }
 
 // errQueueTimeout cancels the wait of a job that stayed queued too long.
@@ -104,7 +108,7 @@ func NewHandler(opts Options) *Handler {
 	if opts.MinBodyRate <= 0 {
 		opts.MinBodyRate = defaultMinBodyRate
 	}
-	h := &Handler{opts: opts, mux: http.NewServeMux(), perIP: newIPLimiter(opts.MaxInFlightPerIP), authLog: newLogLimiter()}
+	h := &Handler{opts: opts, mux: http.NewServeMux(), perIP: newIPLimiter(opts.MaxInFlightPerIP), authLog: newLogLimiter(), browserRefusalLog: newLogLimiter()}
 	h.mux.HandleFunc("/2015-03-31/functions/{name}/invocations", h.invoke)
 	h.mux.HandleFunc("/_loch/health", h.Health)
 	h.mux.HandleFunc("/_loch/metrics", h.metrics)
@@ -393,9 +397,14 @@ func (h *Handler) writeResult(w http.ResponseWriter, id string, res *engine.Resu
 	_, _ = w.Write(res.Payload)
 }
 
-// admit takes a slot of the per-IP cap of requests in flight, or answers
-// 429 (and closes the connection) when the source IP is at its cap.
+// admit is the entry of the protected routes (Invoke API, metrics): it
+// refuses browser requests (refuseBrowser), then takes a slot of the
+// per-IP cap of requests in flight, or answers 429 (and closes the
+// connection) when the source IP is at its cap.
 func (h *Handler) admit(w http.ResponseWriter, r *http.Request, id string) (release func(), ok bool) {
+	if h.refuseBrowser(w, r, id) {
+		return nil, false
+	}
 	release, ok = h.perIP.acquire(r.RemoteAddr)
 	if !ok {
 		w.Header().Set("Connection", "close")

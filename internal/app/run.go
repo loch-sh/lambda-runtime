@@ -235,6 +235,7 @@ func serveInvokeAPI(cfg *config.Config, q *queue.Queue, eng *engine.Engine, auth
 		RetryAfter:          eng.RetryAfter,
 		Auth:                authenticator,
 		LoopbackWithoutAuth: true,
+		AllowBrowser:        cfg.Runtime.AllowBrowser,
 		Observer:            collector,
 		Metrics:             collector,
 		Queue:               q,

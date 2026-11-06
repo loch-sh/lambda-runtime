@@ -341,3 +341,30 @@ func TestInvokeSubcommandEndsPromptly(t *testing.T) {
 		t.Errorf("empty stdin: %v %s", err, out)
 	}
 }
+
+// TestBrowserRequestsRefused: a web page can make a browser POST a
+// "simple" text/plain request to a published port, without a CORS
+// preflight. Even with authentication off, it is refused before the
+// function runs; LOCH_RUNTIME_ALLOW_BROWSER=true accepts it.
+func TestBrowserRequestsRefused(t *testing.T) {
+	path := "/2015-03-31/functions/function/invocations"
+	csrf := http.Header{"Origin": {"http://evil.example"}, "Content-Type": {"text/plain"},
+		"Sec-Fetch-Site": {"cross-site"}, "Sec-Fetch-Mode": {"no-cors"}}
+	c := start(t, images[0], runOptions{})
+	c.waitHealth("ready")
+	r := c.invokeWith("POST", path, []byte(`{"op":"echo"}`), csrf)
+	if r.status != 403 || r.header.Get("X-Amzn-ErrorType") != "AccessDeniedException" {
+		t.Fatalf("browser request: %s", r)
+	}
+	if strings.Contains(c.logs(), "START RequestId") {
+		t.Error("the function ran for a browser request")
+	}
+	if r := c.invoke(`{"op":"echo"}`); r.status != 200 {
+		t.Errorf("plain client: %s", r)
+	}
+	allowed := start(t, images[0], runOptions{env: []string{"LOCH_RUNTIME_ALLOW_BROWSER=true"}})
+	allowed.waitHealth("ready")
+	if r := allowed.invokeWith("POST", path, []byte(`{"op":"echo"}`), csrf); r.status != 200 {
+		t.Errorf("allowed browser request: %s", r)
+	}
+}

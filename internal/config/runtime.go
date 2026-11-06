@@ -70,6 +70,9 @@ type Runtime struct {
 	QueueBytes   int64
 	QueueTimeout time.Duration
 	MaxConns     int
+	// AllowBrowser accepts requests sent by a web browser (see
+	// invokeapi.fromBrowser), refused by default (CSRF, DNS rebinding).
+	AllowBrowser bool
 	LogLevel     string
 	Auth         Auth
 }
@@ -92,6 +95,7 @@ func parseRuntime(v rawValues, env Env, memoryMB int) (Runtime, []error) {
 		QueueTimeout:   p.duration("LOCH_RUNTIME_QUEUE_TIMEOUT", DefaultQueueTimeout, false),
 		MaxPayload:     p.size("LOCH_RUNTIME_MAX_PAYLOAD", DefaultMaxPayload, minPayloadLimit, maxPayloadLimit),
 		QueueSize:      p.integer("LOCH_RUNTIME_QUEUE_SIZE", DefaultQueueSize, 0, maxQueueSize),
+		AllowBrowser:   p.onOff("LOCH_RUNTIME_ALLOW_BROWSER", false),
 		LogLevel:       p.logLevel("LOCH_RUNTIME_LOG_LEVEL"),
 		Auth: Auth{
 			Enabled:         p.onOff("LOCH_RUNTIME_AUTH", true),
@@ -207,16 +211,17 @@ func (p *parser) integer(key string, def, lo, hi int) int {
 	return def
 }
 
+// onOff reads a switch: on/true or off/false.
 func (p *parser) onOff(key string, def bool) bool {
 	switch strings.ToLower(p.values[key]) {
 	case "":
 		return def
-	case "on":
+	case "on", "true":
 		return true
-	case "off":
+	case "off", "false":
 		return false
 	}
-	p.fail(key, "%q is neither on nor off", p.values[key])
+	p.fail(key, "%q is neither on (true) nor off (false)", p.values[key])
 	return def
 }
 

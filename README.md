@@ -116,7 +116,8 @@ setting.
 | `LOCH_RUNTIME_QUEUE_BYTES` | `min(32MiB, memory/8)` | total size of waiting invocations |
 | `LOCH_RUNTIME_QUEUE_TIMEOUT` | `30s` | maximum wait in the queue |
 | `LOCH_RUNTIME_MAX_CONNS` | 8 × (queue size + 1), at most 768 | open connections to the Invoke API (an eighth per source IP, at least 4) |
-| `LOCH_RUNTIME_AUTH` | `on` | `off` disables authentication (development only) |
+| `LOCH_RUNTIME_AUTH` | `on` | `off` (or `false`) disables authentication (development only) |
+| `LOCH_RUNTIME_ALLOW_BROWSER` | `false` | `true` accepts requests from web browsers (`Origin`, `Sec-Fetch-Site`, `Sec-Fetch-Dest`, `Sec-Fetch-User`) |
 | `LOCH_RUNTIME_TOKEN_SHA256` | | hex SHA-256 of the bearer token (recommended) |
 | `LOCH_RUNTIME_TOKEN_SHA256_FILE` | | file holding it |
 | `LOCH_RUNTIME_TOKEN` | | plain bearer token (standalone use: readable by the function) |
@@ -187,6 +188,14 @@ file and every directory above it must be on a read-only mount, or belong
 to another user without being writable by the runtime. A world-writable
 file is refused too. Run the runtime as a non-root user (the image uses
 uid 10001): as root, the whole path, rootfs included, must be read-only.
+
+Requests from web browsers (an `Origin`, `Sec-Fetch-Site`,
+`Sec-Fetch-Dest` or `Sec-Fetch-User` header) are refused with 403, even
+with authentication off: a web page could otherwise make a browser invoke
+the function (CSRF, DNS rebinding). SDKs, the AWS CLI, curl and Node's
+`fetch` are not affected. A reverse proxy forwarding a browser's `Origin`
+is refused too: strip the header at the proxy, or set
+`LOCH_RUNTIME_ALLOW_BROWSER=true`.
 
 SigV4 requests can be replayed within the ±5 min clock skew, and the Invoke
 API is plain HTTP: expose it on private networks only.

@@ -84,3 +84,9 @@ func errBodyTimeout() *awsError {
 	return &awsError{status: http.StatusRequestTimeout, name: "RequestTimeoutException",
 		message: "The request body was not received in time"}
 }
+
+// errBrowser answers a request sent by a web browser (see fromBrowser).
+func errBrowser() *awsError {
+	return &awsError{status: http.StatusForbidden, name: "AccessDeniedException",
+		message: "Browser requests are refused"}
+}
