@@ -18,7 +18,7 @@ def handler(event, context):
     if op == "exit":
         os._exit(3)
     if op == "exit-after-response":
-        threading.Timer(0.05, lambda: os._exit(5)).start()
+        threading.Timer(0.3, lambda: os._exit(5)).start()
         return {"bye": True}
     if op == "oom":
         keep = []

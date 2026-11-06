@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -104,6 +105,7 @@ type runOptions struct {
 // on a random loopback port for the test.
 func start(t *testing.T, img image, o runOptions) *container {
 	t.Helper()
+	pull(t, img.ref)
 	if o.memory == "" {
 		o.memory = "256m"
 	}
@@ -114,7 +116,9 @@ func start(t *testing.T, img image, o runOptions) *container {
 			t.Fatal(err)
 		}
 	}
-	name := fmt.Sprintf("lr-it-%s-%d", img.name, time.Now().UnixNano())
+	// Unique even for parallel subtests started within the clock's
+	// resolution.
+	name := fmt.Sprintf("lr-it-%s-%d-%d", img.name, time.Now().UnixNano(), containerSeq.Add(1))
 	args := []string{"run", "-d", "--name", name,
 		"--read-only", "--user", "10001:10001", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
 		"--tmpfs", "/tmp:size=64m", "--memory", o.memory, "--memory-swap", o.memory, "--cpus", "0.5", "--pids-limit", "128",
@@ -156,6 +160,51 @@ func start(t *testing.T, img image, o runOptions) *container {
 	return c
 }
 
+// containerSeq makes the container names unique.
+var containerSeq atomic.Int64
+
+// pulls holds one pull per image for the whole run: a final failure is
+// shared by every test of that image.
+var pulls sync.Map // ref -> *pulled
+
+type pulled struct {
+	once sync.Once
+	err  error
+}
+
+// pullRetries are the waits between pull attempts: a registry mirror
+// (mirror.gcr.io) may answer "not found" or 429 to the first requests for
+// a tag it has not cached yet.
+var pullRetries = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+
+// pull pulls ref once per run, retrying, before docker run (which would
+// fail with exit status 125 on the first error).
+func pull(t *testing.T, ref string) {
+	t.Helper()
+	v, _ := pulls.LoadOrStore(ref, &pulled{})
+	p := v.(*pulled)
+	p.once.Do(func() {
+		for attempt := 0; ; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			out, err := exec.CommandContext(ctx, "docker", "pull", "--quiet", ref).CombinedOutput()
+			cancel()
+			if err == nil {
+				p.err = nil
+				return
+			}
+			p.err = fmt.Errorf("docker pull %s: %v\n%s", ref, err, out)
+			if attempt == len(pullRetries) {
+				return
+			}
+			t.Logf("docker pull %s failed (attempt %d), retrying in %s:\n%s", ref, attempt+1, pullRetries[attempt], out)
+			time.Sleep(pullRetries[attempt])
+		}
+	})
+	if p.err != nil {
+		t.Fatal(p.err)
+	}
+}
+
 func docker(t *testing.T, args ...string) string {
 	t.Helper()
 	out, err := exec.Command("docker", args...).CombinedOutput()
@@ -168,6 +217,19 @@ func docker(t *testing.T, args ...string) string {
 func (c *container) logs() string {
 	out, _ := exec.Command("docker", "logs", c.name).CombinedOutput()
 	return string(out)
+}
+
+// waitLogs waits for the container logs to satisfy cond.
+func (c *container) waitLogs(cond func(logs string) bool) {
+	c.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond(c.logs()) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	c.t.Fatalf("the logs never reached the expected state:\n%s", c.logs())
 }
 
 // waitHealth waits for /_loch/health to answer want.

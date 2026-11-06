@@ -98,6 +98,12 @@ func TestExitDuringInvocationAndWhileIdle(t *testing.T) {
 		if r.status != 200 || r.functionError != "" || !strings.Contains(string(r.body), "bye") {
 			t.Fatalf("exit after response: %s", r)
 		}
+		// The process dies 300 ms after its response, once idle. Invoking
+		// before that would see the exit during the invocation (correct,
+		// but not this case), so wait for the second exit in the logs; the
+		// next invocations then arrive during or after the re-init and must
+		// be served.
+		c.waitLogs(func(logs string) bool { return strings.Count(logs, "engine: bootstrap exited") >= 2 })
 		for i := range 3 {
 			if r := c.invoke(`{"op":"echo"}`); r.status != 200 || r.functionError != "" {
 				t.Fatalf("invocation %d after the idle exit: %s", i, r)

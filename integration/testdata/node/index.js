@@ -16,7 +16,11 @@ exports.handler = async (event, context) => {
     case 'exit':
       process.exit(3);
     case 'exit-after-response':
-      setTimeout(() => process.exit(5), 50);
+      // Not a timer: the runtime interface client blocks the event loop
+      // while it waits for the next invocation, so a timer would only fire
+      // then. A detached shell kills the process once it is idle.
+      require('child_process').spawn('sh', ['-c', `sleep 0.3; kill -KILL ${process.pid}`],
+        { detached: true, stdio: 'ignore' }).unref();
       return { bye: true };
     case 'oom': {
       const keep = [];
