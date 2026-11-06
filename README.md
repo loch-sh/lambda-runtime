@@ -1,5 +1,7 @@
 # loch lambda-runtime
 
+![loch.sh Lambda Runtime: a custom runtime for your AWS Lambda functions](docs/cover.png)
+
 Run AWS Lambda functions in plain Docker containers, with the official AWS
 base images and unchanged handlers. No vendor lock-in: the runtime speaks
 AWS's public protocols and knows nothing about the platform around it.
@@ -18,17 +20,43 @@ the AWS base images. It is the container's PID 1:
 
 > Status: under development (v1). See [docs/spec.md](docs/spec.md).
 
-## Usage
+## Quick start
 
-The binary is static (no libc, no curl): mount it read-only into any Lambda
-image and make it the entrypoint. A complete standalone example, with the
-hardening Loch.sh Panel applies:
+Build the static Linux binaries (`dist/loch-lambda-runtime-linux-{amd64,arm64}`),
+then run a Node.js function with the official AWS image, the runtime mounted
+as its entrypoint:
 
 ```sh
-# 1. A function and its credentials (keep both values secret).
-mkdir -p fn && cat > fn/index.js <<'JS'
-exports.handler = async (event) => ({ hello: event.name ?? "world" });
-JS
+make binaries
+mkdir -p fn && echo 'exports.handler = async (event) => ({ hello: event.name ?? "world" });' > fn/index.js
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -v "$PWD/dist/loch-lambda-runtime-linux-$ARCH:/loch/lambda-runtime:ro" \
+  -v "$PWD/fn:/var/task:ro" \
+  -e LOCH_RUNTIME_AUTH=off \
+  --entrypoint /loch/lambda-runtime \
+  public.ecr.aws/lambda/nodejs:22 index.handler
+```
+
+In another terminal:
+
+```sh
+curl localhost:8080/2015-03-31/functions/function/invocations -d '{"name":"you"}'
+# {"hello":"you"}
+```
+
+`LOCH_RUNTIME_AUTH=off` is for this local try only: by default, the runtime
+requires a credential (see below).
+
+## Production run
+
+What Loch.sh Panel does: credentials (only the SHA-256 of the bearer token
+enters the container), and a read-only, non-root, capability-free, bounded
+container.
+
+```sh
+# 1. Credentials (keep both values secret). fn/ and $ARCH as in the quick start.
 TOKEN=$(openssl rand -hex 32)          # given to the callers, never to the container
 TOKEN_SHA256=$(printf %s "$TOKEN" | openssl dgst -sha256 -r | cut -d' ' -f1)
 KEY_ID=$(LC_ALL=C tr -dc A-Z0-9 </dev/urandom | head -c 20)  # optional SigV4 pair
@@ -42,10 +70,9 @@ docker run -d --name fn --network fn-net \
   --read-only --user 10001:10001 --cap-drop ALL --security-opt no-new-privileges:true \
   --tmpfs /tmp:size=64m --memory 256m --memory-swap 256m --cpus 0.5 --pids-limit 128 \
   -p 127.0.0.1:8080:8080 \
-  -v "$PWD/loch-lambda-runtime-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/'):/loch/lambda-runtime:ro" \
+  -v "$PWD/dist/loch-lambda-runtime-linux-$ARCH:/loch/lambda-runtime:ro" \
   -v "$PWD/fn:/var/task:ro" \
   --env-file fn.env -e AWS_LAMBDA_FUNCTION_TIMEOUT=30 \
-  --health-cmd "/loch/lambda-runtime health" --health-interval 5s \
   --entrypoint /loch/lambda-runtime \
   public.ecr.aws/lambda/nodejs:22 index.handler
 until docker exec fn /loch/lambda-runtime health >/dev/null; do sleep 0.2; done
@@ -70,11 +97,12 @@ docker inspect --format '{{.State.Health.Status}}' fn
 docker rm -f fn && docker network rm fn-net
 ```
 
-Only the SHA-256 of the bearer token enters the container. See
-[Authentication](#authentication) for what the function's code can and
-cannot read.
+See [Authentication](#authentication) for what the function's code can and
+cannot read. For a healthcheck, prefer compose and its exec form
+(`test: ["CMD", "/loch/lambda-runtime", "health"]`): `docker run
+--health-cmd` only has the shell form (see below).
 
-Command line:
+## Command line
 
 ```
 loch-lambda-runtime [run] [flags] -- <command> [args...]   # the image ENTRYPOINT and CMD
