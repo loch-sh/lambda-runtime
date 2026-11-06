@@ -87,6 +87,15 @@ loch-lambda-runtime version
 Use `run` explicitly if your handler is literally named `health`, `invoke` or
 `version`.
 
+Write the healthcheck in exec form (`["CMD", "/loch/lambda-runtime",
+"health"]`), not `CMD-SHELL`: a shell would hold the container's
+environment in a process the function can read.
+
+The function's code is untrusted: it can forge `START`/`END`/`REPORT` lines
+in its own output, so never derive billing or health from the logs (use
+`/_loch/metrics`, the `invoke` envelope or `/_loch/health`). See the threat
+model in [docs/spec.md](docs/spec.md).
+
 ## Configuration
 
 Every `LOCH_RUNTIME_*` variable also exists as a flag (`--queue-size`, …);
