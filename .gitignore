@@ -3,3 +3,4 @@ dist/
 *.key
 *.minisig
 *.bundle
+.idea/
