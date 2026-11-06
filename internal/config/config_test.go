@@ -356,6 +356,29 @@ func TestMaxConns(t *testing.T) {
 	}
 }
 
+// TestDefaultMaxConns: 8 × (queue size + 1) by default, so that one source
+// IP (an eighth of the connections) can fill the queue; at most 768.
+func TestDefaultMaxConns(t *testing.T) {
+	for _, c := range []struct {
+		queueSize string
+		want      int
+	}{{"", 136}, {"0", 8}, {"63", 512}, {"94", 760}, {"95", 768}, {"96", 768}, {"100000", 768}} {
+		args := []string{"h"}
+		if c.queueSize != "" {
+			args = []string{"--queue-size", c.queueSize, "h"}
+		}
+		cfg, err := Parse(args, sources(t, nil, ""))
+		if err != nil || cfg.Runtime.MaxConns != c.want {
+			t.Errorf("queue size %q: max conns %d, want %d (%v)", c.queueSize, cfg.Runtime.MaxConns, c.want, err)
+		}
+	}
+	// An explicit value is kept, beyond the default cap too.
+	cfg, err := Parse([]string{"--queue-size", "16", "--max-conns", "2000", "h"}, sources(t, nil, ""))
+	if err != nil || cfg.Runtime.MaxConns != 2000 {
+		t.Errorf("explicit max conns: %+v %v", cfg.Runtime.MaxConns, err)
+	}
+}
+
 func TestChildEnvironmentRules(t *testing.T) {
 	env := mapEnv{
 		"LOCH_RUNTIME_TOKEN_FILE":    "/run/secrets/token",

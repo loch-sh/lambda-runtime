@@ -25,12 +25,23 @@ const (
 	responseAllowance   = 100
 	DefaultQueueSize    = 16
 	DefaultQueueTimeout = 30 * time.Second
-	DefaultMaxConns     = 64
 	DefaultLogLevel     = "info"
 	// defaultQueueBytesCap is the upper bound of the default byte budget of
 	// the queue; the default is min(32 MiB, memory/8), never below one
 	// maximum payload.
 	defaultQueueBytesCap = 32 << 20
+
+	// ConnsPerIPShare: one source IP may hold 1/ConnsPerIPShare of the
+	// Invoke API connections (internal/app, limits.go). The default
+	// connection cap is ConnsPerIPShare × (queue size + 1), so that one IP
+	// can fill the queue.
+	ConnsPerIPShare = 8
+	// FileMargin is the room left, under the open files limit, for the
+	// runtime's other descriptors (Runtime API, health, pipes, logs).
+	FileMargin = 256
+	// defaultMaxConnsCap bounds the default connection cap, under the usual
+	// 1024 open files.
+	defaultMaxConnsCap = 1024 - FileMargin
 
 	maxQueueSize    = 100000
 	maxConns        = 100000
@@ -81,7 +92,6 @@ func parseRuntime(v rawValues, env Env, memoryMB int) (Runtime, []error) {
 		QueueTimeout:   p.duration("LOCH_RUNTIME_QUEUE_TIMEOUT", DefaultQueueTimeout, false),
 		MaxPayload:     p.size("LOCH_RUNTIME_MAX_PAYLOAD", DefaultMaxPayload, minPayloadLimit, maxPayloadLimit),
 		QueueSize:      p.integer("LOCH_RUNTIME_QUEUE_SIZE", DefaultQueueSize, 0, maxQueueSize),
-		MaxConns:       p.integer("LOCH_RUNTIME_MAX_CONNS", DefaultMaxConns, 1, maxConns),
 		LogLevel:       p.logLevel("LOCH_RUNTIME_LOG_LEVEL"),
 		Auth: Auth{
 			Enabled:         p.onOff("LOCH_RUNTIME_AUTH", true),
@@ -93,6 +103,8 @@ func parseRuntime(v rawValues, env Env, memoryMB int) (Runtime, []error) {
 			AccessKeyFile:   p.absPath("LOCH_RUNTIME_ACCESS_KEY_FILE"),
 		},
 	}
+	// These defaults depend on the values parsed above.
+	rt.MaxConns = p.integer("LOCH_RUNTIME_MAX_CONNS", DefaultMaxConns(rt.QueueSize), 1, maxConns)
 	rt.QueueBytes = p.size("LOCH_RUNTIME_QUEUE_BYTES", defaultQueueBytes(rt.MaxPayload, memoryMB), 0, maxQueueBytes)
 	if rt.QueueBytes < rt.MaxPayload && v["LOCH_RUNTIME_QUEUE_BYTES"] != "" {
 		p.fail("LOCH_RUNTIME_QUEUE_BYTES", "%d is below LOCH_RUNTIME_MAX_PAYLOAD (%d)", rt.QueueBytes, rt.MaxPayload)
@@ -105,6 +117,13 @@ func secretFrom(env Env, key string) Secret { return Secret(lookupTrimmed(env, k
 func lookupTrimmed(env Env, key string) string {
 	v, _ := env.Lookup(key)
 	return strings.TrimSpace(v)
+}
+
+// DefaultMaxConns is the default cap of open Invoke API connections:
+// ConnsPerIPShare × (queueSize + 1), so that one source IP can fill the
+// queue, at most defaultMaxConnsCap (768).
+func DefaultMaxConns(queueSize int) int {
+	return min(ConnsPerIPShare*(queueSize+1), defaultMaxConnsCap)
 }
 
 // defaultQueueBytes is min(32 MiB, memory/8), raised to one maximum payload

@@ -106,7 +106,7 @@ setting.
 | `LOCH_RUNTIME_QUEUE_SIZE` | `16` | waiting invocations |
 | `LOCH_RUNTIME_QUEUE_BYTES` | `min(32MiB, memory/8)` | total size of waiting invocations |
 | `LOCH_RUNTIME_QUEUE_TIMEOUT` | `30s` | maximum wait in the queue |
-| `LOCH_RUNTIME_MAX_CONNS` | `64` | open connections to the Invoke API |
+| `LOCH_RUNTIME_MAX_CONNS` | 8 × (queue size + 1), at most 768 | open connections to the Invoke API (an eighth per source IP, at least 4) |
 | `LOCH_RUNTIME_AUTH` | `on` | `off` disables authentication (development only) |
 | `LOCH_RUNTIME_TOKEN_SHA256` | | hex SHA-256 of the bearer token (recommended) |
 | `LOCH_RUNTIME_TOKEN_SHA256_FILE` | | file holding it |

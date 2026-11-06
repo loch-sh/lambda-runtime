@@ -64,6 +64,7 @@ func Run(cfg *config.Config, env Env) int {
 		return 1
 	}
 	logStartup(cfg, log)
+	warnLowFileLimit(cfg.Runtime.MaxConns, openFilesLimit, log)
 
 	ctx, stop := shutdownContext(env)
 	defer stop()
@@ -248,31 +249,6 @@ func serveInvokeAPI(cfg *config.Config, q *queue.Queue, eng *engine.Engine, auth
 	go serve(health, netutil.LimitListener(healthLn, healthConns), log)
 	return invoke, health, nil
 }
-
-// unverifiedLimits bound the requests not authenticated yet (SigV4 without
-// a payload hash header): a quarter of the byte budget, at least one
-// maximum body, and one maximum body per IP; a quarter of the queue size,
-// at least one, and a quarter of that per IP (clients behind a NAT or a
-// proxy share an IP).
-func unverifiedLimits(rt config.Runtime) queue.UnverifiedLimits {
-	const (
-		share   = 4 // of the queue (bytes and count) left to unverified requests
-		ipShare = 4 // of the unverified count left to one IP
-	)
-	count := max(1, rt.QueueSize/share)
-	return queue.UnverifiedLimits{
-		Bytes:      max(rt.QueueBytes/share, rt.MaxPayload),
-		PerIP:      rt.MaxPayload,
-		Count:      count,
-		CountPerIP: max(1, count/ipShare),
-	}
-}
-
-// connsPerIP caps the open Invoke API connections of one source IP
-// (loopback exempt), idle keep-alive ones included, at half the global
-// cap, so that one client cannot hold every slot. The requests in flight
-// are capped separately, per IP, at the queue size + 1.
-func connsPerIP(maxConns int) int { return max(1, maxConns/2) }
 
 func serve(srv *http.Server, ln net.Listener, log *slog.Logger) {
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
