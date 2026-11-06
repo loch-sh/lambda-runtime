@@ -139,6 +139,11 @@ credential (`LOCH_RUNTIME_AUTH=off` disables this, for local development
 only). Callers on the loopback (the function itself, `docker exec`
 processes such as `invoke` and `health`) need none.
 
+Never run the container with `--network host`: the loopback exemption
+assumes the container has its own network namespace. With the host's,
+every local process of the host could invoke the function and read its
+metrics without a credential.
+
 - **Bearer token, configured as its SHA-256** (recommended):
   `LOCH_RUNTIME_TOKEN_SHA256` (64 hex) or `LOCH_RUNTIME_TOKEN_SHA256_FILE`.
   Callers send `Authorization: Bearer <token>`; the runtime compares hashes
