@@ -43,12 +43,18 @@ type Queue struct {
 	closed bool
 	// ready is signalled when an entry is queued or the queue closes.
 	ready chan struct{}
+	// unverified accounts the reservations of requests not authenticated
+	// yet (see unverified.go).
+	unverified unverifiedBudget
 }
 
 // New returns a queue holding at most maxCount waiting requests and
 // maxBytes of their bodies.
 func New(maxCount int, maxBytes int64) *Queue {
-	return &Queue{maxCount: maxCount, maxBytes: maxBytes, items: list.New(), ready: make(chan struct{}, 1)}
+	return &Queue{
+		maxCount: maxCount, maxBytes: maxBytes, items: list.New(), ready: make(chan struct{}, 1),
+		unverified: unverifiedBudget{max: maxBytes, perIP: maxBytes, byIP: map[string]int64{}},
+	}
 }
 
 // Reservation is room taken in the queue for a request whose body is not
@@ -58,6 +64,8 @@ type Reservation struct {
 	bytes int64
 	// slotFreed and bytesFreed record what was given back.
 	slotFreed, bytesFreed bool
+	// unverifiedIP is set while the request is not authenticated yet.
+	unverifiedIP string
 }
 
 // Entry is a queued job.
@@ -68,20 +76,31 @@ type Entry struct {
 	taken bool
 }
 
-// Reserve takes room for a request of up to n bytes.
+// Reserve takes room for an authenticated request of up to n bytes.
 func (q *Queue) Reserve(n int64) (*Reservation, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if err := q.admitLocked(n); err != nil {
+		return nil, err
+	}
+	return q.takeLocked(n), nil
+}
+
+func (q *Queue) admitLocked(n int64) error {
 	switch {
 	case q.closed:
-		return nil, ErrClosed
+		return ErrClosed
 	case q.count >= q.maxCount, q.bytes+n > q.maxBytes:
-		return nil, ErrFull
+		return ErrFull
 	}
+	return nil
+}
+
+func (q *Queue) takeLocked(n int64) *Reservation {
 	q.count++
 	q.bytes += n
 	q.peak = max(q.peak, q.count)
-	return &Reservation{q: q, bytes: n}, nil
+	return &Reservation{q: q, bytes: n}
 }
 
 // Shrink lowers the reservation to the actual body size once it is read.
@@ -90,6 +109,7 @@ func (r *Reservation) Shrink(n int64) {
 	defer r.q.mu.Unlock()
 	if !r.bytesFreed && n < r.bytes {
 		r.q.bytes -= r.bytes - n
+		r.q.unverified.shrink(r.unverifiedIP, r.bytes-n)
 		r.bytes = n
 	}
 }
@@ -105,6 +125,7 @@ func (r *Reservation) Release() {
 func (r *Reservation) releaseLocked() {
 	r.freeSlotLocked()
 	r.freeBytesLocked()
+	r.verifiedLocked()
 }
 
 func (r *Reservation) freeSlotLocked() {

@@ -16,8 +16,9 @@ import (
 // (without reading the request), then it is closed. Loopback clients are
 // exempt: they are inside the container (`docker exec … invoke`, the
 // healthcheck), and still bound by the global cap.
-func PerIPLimitListener(l net.Listener, n int, refused []byte) net.Listener {
-	return &perIPListener{Listener: l, max: n, refused: refused, open: map[netip.Addr]int{}}
+// onRefuse, when not nil, is called for each refused connection (metrics).
+func PerIPLimitListener(l net.Listener, n int, refused []byte, onRefuse func()) net.Listener {
+	return &perIPListener{Listener: l, max: n, refused: refused, onRefuse: onRefuse, open: map[netip.Addr]int{}}
 }
 
 // refuseWriteTimeout bounds the write of the refusal, which runs in the
@@ -26,8 +27,9 @@ const refuseWriteTimeout = 100 * time.Millisecond
 
 type perIPListener struct {
 	net.Listener
-	max     int
-	refused []byte
+	max      int
+	refused  []byte
+	onRefuse func()
 
 	mu   sync.Mutex
 	open map[netip.Addr]int
@@ -51,6 +53,9 @@ func (l *perIPListener) Accept() (net.Conn, error) {
 }
 
 func (l *perIPListener) refuse(c net.Conn) {
+	if l.onRefuse != nil {
+		l.onRefuse()
+	}
 	if len(l.refused) > 0 {
 		_ = c.SetWriteDeadline(time.Now().Add(refuseWriteTimeout))
 		_, _ = c.Write(l.refused)

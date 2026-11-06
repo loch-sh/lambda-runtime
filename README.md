@@ -21,19 +21,58 @@ the AWS base images. It is the container's PID 1:
 ## Usage
 
 The binary is static (no libc, no curl): mount it read-only into any Lambda
-image and make it the entrypoint.
+image and make it the entrypoint. A complete standalone example, with the
+hardening Loch.sh Panel applies:
 
 ```sh
-docker run --rm -p 127.0.0.1:8080:8080 \
-  -v "$PWD/loch-lambda-runtime-linux-arm64:/loch/lambda-runtime:ro" \
-  -v "$PWD/code:/var/task:ro" \
-  -e LOCH_RUNTIME_AUTH=off \
-  -e AWS_LAMBDA_FUNCTION_TIMEOUT=30 \
+# 1. A function and its credentials (keep both values secret).
+mkdir -p fn && cat > fn/index.js <<'JS'
+exports.handler = async (event) => ({ hello: event.name ?? "world" });
+JS
+TOKEN=$(openssl rand -hex 32)          # given to the callers, never to the container
+TOKEN_SHA256=$(printf %s "$TOKEN" | openssl dgst -sha256 -r | cut -d' ' -f1)
+KEY_ID=$(LC_ALL=C tr -dc A-Z0-9 </dev/urandom | head -c 20)  # optional SigV4 pair
+KEY_SECRET=$(openssl rand -base64 30)
+printf 'LOCH_RUNTIME_TOKEN_SHA256=%s\nLOCH_RUNTIME_ACCESS_KEY=%s:%s\n' "$TOKEN_SHA256" "$KEY_ID" "$KEY_SECRET" > fn.env
+chmod 600 fn.env
+
+# 2. The function container: read-only, non-root, no capability, bounded.
+docker network create fn-net
+docker run -d --name fn --network fn-net \
+  --read-only --user 10001:10001 --cap-drop ALL --security-opt no-new-privileges:true \
+  --tmpfs /tmp:size=64m --memory 256m --memory-swap 256m --cpus 0.5 --pids-limit 128 \
+  -p 127.0.0.1:8080:8080 \
+  -v "$PWD/loch-lambda-runtime-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/'):/loch/lambda-runtime:ro" \
+  -v "$PWD/fn:/var/task:ro" \
+  --env-file fn.env -e AWS_LAMBDA_FUNCTION_TIMEOUT=30 \
+  --health-cmd "/loch/lambda-runtime health" --health-interval 5s \
   --entrypoint /loch/lambda-runtime \
   public.ecr.aws/lambda/nodejs:22 index.handler
+until docker exec fn /loch/lambda-runtime health >/dev/null; do sleep 0.2; done
 
-curl -X POST localhost:8080/2015-03-31/functions/function/invocations -d '{"hello":"world"}'
+# 3a. Invoke with curl and the bearer token.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  localhost:8080/2015-03-31/functions/function/invocations -d '{"name":"curl"}'
+
+# 3b. Invoke with the AWS CLI (SigV4), from a container on the same network.
+docker run --rm --network fn-net \
+  -e AWS_ACCESS_KEY_ID="$KEY_ID" -e AWS_SECRET_ACCESS_KEY="$KEY_SECRET" -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:2.39.5 lambda invoke --endpoint-url http://fn:8080 --function-name function \
+  --payload '{"name":"cli"}' --cli-binary-format raw-in-base64-out /dev/stdout
+
+# 3c. Invoke from inside the container (what Loch.sh Panel does): the
+#     loopback needs no credential.
+echo '{"name":"exec"}' | docker exec -i fn /loch/lambda-runtime invoke --log-tail
+
+# Logs (START/END/REPORT lines), health, cleanup.
+docker logs fn
+docker inspect --format '{{.State.Health.Status}}' fn
+docker rm -f fn && docker network rm fn-net
 ```
+
+Only the SHA-256 of the bearer token enters the container. See
+[Authentication](#authentication) for what the function's code can and
+cannot read.
 
 Command line:
 
@@ -69,9 +108,11 @@ setting.
 | `LOCH_RUNTIME_QUEUE_TIMEOUT` | `30s` | maximum wait in the queue |
 | `LOCH_RUNTIME_MAX_CONNS` | `64` | open connections to the Invoke API |
 | `LOCH_RUNTIME_AUTH` | `on` | `off` disables authentication (development only) |
-| `LOCH_RUNTIME_TOKEN` | | bearer token (read at startup, then removed from the environment) |
-| `LOCH_RUNTIME_TOKEN_FILE` | | file holding the bearer token |
-| `LOCH_RUNTIME_ACCESS_KEY` | | `<access key id>:<secret>` for SigV4 (removed from the environment once read) |
+| `LOCH_RUNTIME_TOKEN_SHA256` | | hex SHA-256 of the bearer token (recommended) |
+| `LOCH_RUNTIME_TOKEN_SHA256_FILE` | | file holding it |
+| `LOCH_RUNTIME_TOKEN` | | plain bearer token (standalone use: readable by the function) |
+| `LOCH_RUNTIME_TOKEN_FILE` | | file holding the plain bearer token |
+| `LOCH_RUNTIME_ACCESS_KEY` | | `<access key id>:<secret>` for SigV4, optional (readable by the function) |
 | `LOCH_RUNTIME_ACCESS_KEY_FILE` | | file holding `<access key id>:<secret>` for SigV4 |
 | `LOCH_RUNTIME_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
@@ -91,19 +132,81 @@ runtime expects when they are absent (`AWS_LAMBDA_LOG_GROUP_NAME`,
 `AWS_LAMBDA_MAX_CONCURRENCY` and every `LOCH_RUNTIME_*` variable are always
 removed. No credential is ever invented.
 
+## Authentication
+
+Network callers must authenticate; the runtime refuses to start without a
+credential (`LOCH_RUNTIME_AUTH=off` disables this, for local development
+only). Callers on the loopback (the function itself, `docker exec`
+processes such as `invoke` and `health`) need none.
+
+- **Bearer token, configured as its SHA-256** (recommended):
+  `LOCH_RUNTIME_TOKEN_SHA256` (64 hex) or `LOCH_RUNTIME_TOKEN_SHA256_FILE`.
+  Callers send `Authorization: Bearer <token>`; the runtime compares hashes
+  in constant time. The token itself is never in the container.
+- A plain token (`LOCH_RUNTIME_TOKEN` or `LOCH_RUNTIME_TOKEN_FILE`, 32 bytes
+  at least) works too, for standalone use only: the function's code runs
+  under the same uid and can read it in the environment of the
+  `docker exec` processes (`/proc/<pid>/environ`).
+- **AWS SigV4**, optional, so the AWS CLI and SDKs work unchanged:
+  `LOCH_RUNTIME_ACCESS_KEY` or `LOCH_RUNTIME_ACCESS_KEY_FILE`
+  (`<access key id>:<secret>`). HMAC needs the secret itself, so **the
+  function can read its own SigV4 secret**: that only lets it invoke
+  itself. Never present that secret as protected from the function's code.
+
+```sh
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… aws lambda invoke \
+  --endpoint-url http://fn:8080 --function-name function \
+  --payload '{"hello":"world"}' --cli-binary-format raw-in-base64-out out.json
+```
+
+Credentials from the environment are read once, then removed from the
+runtime's environment; the `*_FILE` variants (regular files) are re-read on
+SIGHUP: rotate by renaming a complete new file over the old one. A reload
+that fails keeps the credentials in force, so writing an invalid credential
+revokes nothing: to revoke, restart with new credentials. One source per
+credential. Generate the access key id at random and keep it private too.
+
+SigV4 requests can be replayed within the ±5 min clock skew, and the Invoke
+API is plain HTTP: expose it on private networks only.
+
+`/_loch/health` needs no credential; `/_loch/metrics` (Prometheus text
+format) does, except from the loopback.
+
+### Local invoke
+
+`invoke` reads the event on stdin and prints a JSON envelope (`statusCode`,
+`functionError`, `requestId`, `durationMs`, base64 `payload` and `logTail`):
+
+```sh
+echo '{"hello":"world"}' | docker exec -i fn /loch/lambda-runtime invoke --log-tail
+```
+
+It always ends by its deadline: `--timeout`, by default the function timeout
+\+ `LOCH_RUNTIME_QUEUE_TIMEOUT` + 5 s (the event must arrive on stdin within
+10 s). Docker cannot kill an exec process and does not close its stdout when
+the client goes away, but it closes its stdin: with `--watch-stdin`, the
+event is the first JSON value on stdin, the caller keeps stdin open, and
+`invoke` ends within a second once stdin closes. Exit codes: 0 delivered
+(whatever the function returned), 1 transport error or caller gone, 2
+unusable event.
+
 ## Not supported (v1)
 
 Extensions and Telemetry APIs (layer extensions in `/opt/extensions` are not
 started), response streaming to the client (streamed responses are buffered),
-SnapStart, X-Ray export, asynchronous `Event` invocations.
+SnapStart, X-Ray export, asynchronous `Event` invocations (400),
+`Lambda-Runtime-Invocation-Id`. `Max Memory Used` is the container's peak
+since it started, not the invocation's.
 
 ## Development
 
 ```sh
 make test         # unit tests (race detector)
+make integration  # against the real AWS images (Docker)
 make test-linux   # unit tests in a Linux container
 make cover        # coverage
-make release      # static linux/amd64 and linux/arm64 binaries + SHA256SUMS
+make release      # static binaries, SBOMs, SHA256SUMS (signing: docs/release.md)
+make reproducible # two builds in two directories give the same sha256
 ```
 
 ## License

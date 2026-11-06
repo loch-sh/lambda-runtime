@@ -32,6 +32,7 @@ var settings = []setting{
 	{"max-conns", "LOCH_RUNTIME_MAX_CONNS", "maximum number of open connections to the Invoke API"},
 	{"auth", "LOCH_RUNTIME_AUTH", "on (default) or off"},
 	{"token-file", "LOCH_RUNTIME_TOKEN_FILE", "file holding the bearer token"},
+	{"token-sha256-file", "LOCH_RUNTIME_TOKEN_SHA256_FILE", "file holding the hex SHA-256 of the bearer token"},
 	{"access-key-file", "LOCH_RUNTIME_ACCESS_KEY_FILE", "file holding <access key id>:<secret> for SigV4"},
 	{"log-level", "LOCH_RUNTIME_LOG_LEVEL", "debug, info, warn or error"},
 }
@@ -45,8 +46,9 @@ type parsedFlags struct {
 	positional []string
 	values     rawValues
 	// Options of the invoke subcommand.
-	timeout string
-	logTail bool
+	timeout    string
+	logTail    bool
+	watchStdin bool
 }
 
 // parseFlags parses the flags of cmd and completes them with the
@@ -63,6 +65,8 @@ func parseFlags(args []string, cmd Command, src Sources) (*parsedFlags, error) {
 	if cmd == CommandInvoke {
 		fs.StringVar(&out.timeout, "timeout", "", "deadline of the call (default: function timeout + queue timeout + 5s)")
 		fs.BoolVar(&out.logTail, "log-tail", false, "include the last 4 KB of the invocation logs")
+		fs.BoolVar(&out.watchStdin, "watch-stdin", false,
+			"the event is the first JSON value on stdin; stdin closing afterwards means the caller is gone")
 	}
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -84,7 +88,7 @@ func parseFlags(args []string, cmd Command, src Sources) (*parsedFlags, error) {
 
 // invokeOptions validates the options of the invoke subcommand.
 func (f *parsedFlags) invokeOptions(defaultTimeout time.Duration) (Invoke, error) {
-	opts := Invoke{Timeout: defaultTimeout, LogTail: f.logTail}
+	opts := Invoke{Timeout: defaultTimeout, LogTail: f.logTail, WatchStdin: f.watchStdin}
 	if f.timeout == "" {
 		return opts, nil
 	}

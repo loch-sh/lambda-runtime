@@ -16,15 +16,27 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/loch-sh/lambda-runtime/internal/auth"
 	"github.com/loch-sh/lambda-runtime/internal/engine"
 	"github.com/loch-sh/lambda-runtime/internal/queue"
 )
 
 // Authenticator checks the credential of a request before its body is
-// read. It returns nil when the request may proceed, else the error to
-// answer.
+// read. It returns the error to answer, or nil and the check that still
+// needs the body (nil when none).
 type Authenticator interface {
-	Authenticate(r *http.Request) error
+	Authenticate(r *http.Request) (auth.BodyCheck, error)
+}
+
+// Observer is told about the requests refused before reaching the engine.
+type Observer interface {
+	Throttled()
+	AuthFailed()
+}
+
+// MetricsWriter writes the metrics in the Prometheus text format.
+type MetricsWriter interface {
+	WriteTo(w io.Writer) (int64, error)
 }
 
 // StateFunc returns the state of the runtime, for the health endpoint.
@@ -45,10 +57,18 @@ type Options struct {
 	// nil means 1.
 	RetryAfter func() int
 	// Auth is nil when authentication is off.
-	Auth  Authenticator
-	Queue *queue.Queue
-	State StateFunc
-	Log   *slog.Logger
+	Auth Authenticator
+	// LoopbackWithoutAuth exempts loopback callers from authentication:
+	// inside the container's network namespace, only the function itself
+	// and docker exec processes (invoke, health) can connect, and the
+	// function gains nothing by invoking itself.
+	LoopbackWithoutAuth bool
+	// Observer and Metrics may be nil.
+	Observer Observer
+	Metrics  MetricsWriter
+	Queue    *queue.Queue
+	State    StateFunc
+	Log      *slog.Logger
 }
 
 // Handler serves the Invoke API and /_loch/health.
@@ -56,6 +76,8 @@ type Handler struct {
 	opts  Options
 	mux   *http.ServeMux
 	perIP *ipLimiter
+	// authLog limits the logs of authentication failures.
+	authLog *logLimiter
 }
 
 // errQueueTimeout cancels the wait of a job that stayed queued too long.
@@ -69,6 +91,9 @@ const (
 	bodyProgress = 5 * time.Second
 	// maxRetryAfter bounds the advertised Retry-After, in seconds.
 	maxRetryAfter = 30
+	// unverifiedBodyRate is the minimum upload rate of a request not
+	// authenticated yet: 6 MiB within 5 s + 1.5 s.
+	unverifiedBodyRate = 4 << 20
 	// defaultMinBodyRate applies when Options.MinBodyRate is unset.
 	defaultMinBodyRate = 1 << 20
 )
@@ -78,9 +103,10 @@ func NewHandler(opts Options) *Handler {
 	if opts.MinBodyRate <= 0 {
 		opts.MinBodyRate = defaultMinBodyRate
 	}
-	h := &Handler{opts: opts, mux: http.NewServeMux(), perIP: newIPLimiter(opts.MaxInFlightPerIP)}
+	h := &Handler{opts: opts, mux: http.NewServeMux(), perIP: newIPLimiter(opts.MaxInFlightPerIP), authLog: newLogLimiter()}
 	h.mux.HandleFunc("/2015-03-31/functions/{name}/invocations", h.invoke)
 	h.mux.HandleFunc("/_loch/health", h.Health)
+	h.mux.HandleFunc("/_loch/metrics", h.metrics)
 	h.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		errRouteNotFound().write(w, requestID())
 	})
@@ -98,32 +124,28 @@ func (h *Handler) invoke(w http.ResponseWriter, r *http.Request) {
 		errMethod().write(w, id)
 		return
 	}
-	release, ok := h.perIP.acquire(r.RemoteAddr)
+	release, ok := h.admit(w, r, id)
 	if !ok {
-		w.Header().Set("Connection", "close")
-		h.writeErr(w, id, h.throttled())
 		return
 	}
 	defer release()
-	if h.opts.Auth != nil {
-		if err := h.opts.Auth.Authenticate(r); err != nil {
-			h.writeErr(w, id, err)
-			return
-		}
+	bodyCheck, err := h.authenticate(r)
+	if err != nil {
+		h.fail(w, r, id, err)
+		return
 	}
 	job, invType, err := h.parse(r, id)
 	if err != nil {
-		h.writeErr(w, id, err)
+		h.fail(w, r, id, err)
 		return
 	}
 	if invType == typeDryRun {
-		w.Header().Set("X-Amzn-RequestId", id)
-		w.WriteHeader(http.StatusNoContent)
+		h.dryRun(w, r, id, bodyCheck)
 		return
 	}
-	res, err := h.run(w, r, job)
+	res, err := h.run(w, r, job, bodyCheck)
 	if err != nil {
-		h.writeErr(w, id, err)
+		h.fail(w, r, id, err)
 		return
 	}
 	if res != nil {
@@ -161,24 +183,11 @@ func (h *Handler) parse(r *http.Request, id string) (*engine.Job, string, error)
 
 // run admits, reads and queues the request, then waits for its result. A
 // nil result with a nil error means the client went away.
-func (h *Handler) run(w http.ResponseWriter, r *http.Request, job *engine.Job) (*engine.Result, error) {
-	reserve := r.ContentLength
-	if reserve < 0 {
-		reserve = h.opts.MaxPayload
-	}
-	res, err := h.opts.Queue.Reserve(reserve)
-	switch {
-	case errors.Is(err, queue.ErrFull):
-		return nil, h.throttled()
-	case err != nil:
-		return nil, errShuttingDown()
-	}
-	body, err := h.readBody(w, r, reserve)
+func (h *Handler) run(w http.ResponseWriter, r *http.Request, job *engine.Job, bodyCheck auth.BodyCheck) (*engine.Result, error) {
+	body, res, err := h.receive(w, r, bodyCheck)
 	if err != nil {
-		res.Release()
 		return nil, err
 	}
-	res.Shrink(int64(len(body)))
 	job.Payload = body
 	job.Expires = time.Now().Add(h.opts.QueueTimeout)
 	entry, err := res.Enqueue(job)
@@ -188,18 +197,71 @@ func (h *Handler) run(w http.ResponseWriter, r *http.Request, job *engine.Job) (
 	return h.wait(r.Context(), entry)
 }
 
+// receive reserves room in the queue, reads the body and completes the
+// authentication with it. On success the reservation holds the body.
+//
+// A request whose authentication needs the body (SigV4 without a payload
+// hash header) is not authenticated yet: its reservation comes from the
+// smaller unverified budget, and its body must arrive faster.
+func (h *Handler) receive(w http.ResponseWriter, r *http.Request, bodyCheck auth.BodyCheck) ([]byte, *queue.Reservation, error) {
+	reserve := r.ContentLength
+	if reserve < 0 {
+		reserve = h.opts.MaxPayload
+	}
+	unverified := bodyCheck != nil
+	rate := h.opts.MinBodyRate
+	var res *queue.Reservation
+	var err error
+	if unverified {
+		res, err = h.opts.Queue.ReserveUnverified(reserve, remoteIP(r.RemoteAddr))
+		rate = max(rate, unverifiedBodyRate)
+	} else {
+		res, err = h.opts.Queue.Reserve(reserve)
+	}
+	switch {
+	case errors.Is(err, queue.ErrFull):
+		return nil, nil, h.throttled()
+	case err != nil:
+		return nil, nil, errShuttingDown()
+	}
+	body, err := h.readBody(w, r, reserve, rate)
+	if err == nil && unverified {
+		err = bodyCheck(body)
+	}
+	if err != nil {
+		res.Release()
+		return nil, nil, err
+	}
+	res.Verified()
+	res.Shrink(int64(len(body)))
+	return body, res, nil
+}
+
+// dryRun answers a DryRun invocation: 204 once the request is fully
+// authenticated (a SigV4 signature covers the body), nothing invoked.
+func (h *Handler) dryRun(w http.ResponseWriter, r *http.Request, id string, bodyCheck auth.BodyCheck) {
+	_, res, err := h.receive(w, r, bodyCheck)
+	if err != nil {
+		h.fail(w, r, id, err)
+		return
+	}
+	res.Release()
+	w.Header().Set("X-Amzn-RequestId", id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // readBody reads the body within the payload limit, into a buffer of the
 // exact size when Content-Length is known (memory matches what the queue
 // accounts). The upload must keep progressing (bodyProgress between
 // reads) and end before a deadline that grows with its size, so that a
 // slow sender cannot hold a queue reservation for long.
-func (h *Handler) readBody(w http.ResponseWriter, r *http.Request, size int64) ([]byte, error) {
+func (h *Handler) readBody(w http.ResponseWriter, r *http.Request, size, rate int64) ([]byte, error) {
 	rc := http.NewResponseController(w)
 	defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
 	body := &progressReader{
 		r:    http.MaxBytesReader(w, r.Body, h.opts.MaxPayload),
 		rc:   rc,
-		hard: time.Now().Add(bodyGrace + time.Duration(size*int64(time.Second)/h.opts.MinBodyRate)),
+		hard: time.Now().Add(bodyGrace + time.Duration(size*int64(time.Second)/rate)),
 	}
 	var data []byte
 	var err error
@@ -288,6 +350,9 @@ func (h *Handler) wait(ctx context.Context, entry *queue.Entry) (*engine.Result,
 // throttled is the 429 answer, with the Retry-After the runtime advises
 // (the time left before a re-init, for instance).
 func (h *Handler) throttled() *awsError {
+	if h.opts.Observer != nil {
+		h.opts.Observer.Throttled()
+	}
 	retry := 1
 	if h.opts.RetryAfter != nil {
 		retry = min(max(h.opts.RetryAfter(), 1), maxRetryAfter)
@@ -311,16 +376,61 @@ func (h *Handler) writeResult(w http.ResponseWriter, id string, res *engine.Resu
 	_, _ = w.Write(res.Payload)
 }
 
-func (h *Handler) writeErr(w http.ResponseWriter, id string, err error) {
-	var aerr *awsError
-	if !errors.As(err, &aerr) {
+// admit takes a slot of the per-IP cap of requests in flight, or answers
+// 429 (and closes the connection) when the source IP is at its cap.
+func (h *Handler) admit(w http.ResponseWriter, r *http.Request, id string) (release func(), ok bool) {
+	release, ok = h.perIP.acquire(r.RemoteAddr)
+	if !ok {
+		w.Header().Set("Connection", "close")
+		h.fail(w, r, id, h.throttled())
+	}
+	return release, ok
+}
+
+// authenticate checks the credential; nothing when authentication is off
+// or for an exempt loopback caller (Options.LoopbackWithoutAuth).
+func (h *Handler) authenticate(r *http.Request) (auth.BodyCheck, error) {
+	if h.opts.Auth == nil || (h.opts.LoopbackWithoutAuth && isLoopback(r.RemoteAddr)) {
+		return nil, nil
+	}
+	return h.opts.Auth.Authenticate(r)
+}
+
+// fail answers err in the AWS shape. An authentication failure also
+// closes the connection, is counted, and is logged at most once a minute
+// per source IP.
+func (h *Handler) fail(w http.ResponseWriter, r *http.Request, id string, err error) {
+	aerr, isAuth := asAWSError(err)
+	switch {
+	case isAuth:
+		w.Header().Set("Connection", "close")
+		if h.opts.Observer != nil {
+			h.opts.Observer.AuthFailed()
+		}
+		if h.authLog.allow(r.RemoteAddr) {
+			h.opts.Log.Warn("invoke: authentication failed", "remote", r.RemoteAddr, "error_type", aerr.name)
+		}
+	case aerr == nil:
 		aerr = &awsError{status: http.StatusInternalServerError, name: "ServiceException", message: "Internal error"}
 		h.opts.Log.Error("invoke: unexpected error", "request_id", id, "error", err)
-	}
-	if aerr.status == http.StatusTooManyRequests || aerr.status >= 500 {
+	case aerr.status == http.StatusTooManyRequests || aerr.status >= 500:
 		h.opts.Log.Info("invoke: refused", "request_id", id, "error_type", aerr.name)
 	}
 	aerr.write(w, id)
+}
+
+// asAWSError converts err to the AWS error to answer, telling whether it
+// is an authentication failure; nil for an unexpected error.
+func asAWSError(err error) (*awsError, bool) {
+	var authErr *auth.Error
+	if errors.As(err, &authErr) {
+		return &awsError{status: authErr.Status, name: authErr.Name, message: authErr.Message}, true
+	}
+	var aerr *awsError
+	if errors.As(err, &aerr) {
+		return aerr, false
+	}
+	return nil, false
 }
 
 // Health serves GET /_loch/health; it never invokes the function and needs
@@ -345,4 +455,35 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_, _ = w.Write(b)
+}
+
+// metrics serves GET /_loch/metrics, behind the same credential and
+// per-IP cap as the Invoke API.
+func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
+	id := requestID()
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		errMethod().write(w, id)
+		return
+	}
+	release, ok := h.admit(w, r, id)
+	if !ok {
+		return
+	}
+	defer release()
+	check, err := h.authenticate(r)
+	if err == nil && check != nil {
+		err = check(nil) // a GET has no body
+	}
+	if err != nil {
+		h.fail(w, r, id, err)
+		return
+	}
+	if h.opts.Metrics == nil {
+		errRouteNotFound().write(w, id)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = h.opts.Metrics.WriteTo(w)
 }

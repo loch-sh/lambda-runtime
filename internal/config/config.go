@@ -35,7 +35,7 @@ const Usage = `usage:
   loch-lambda-runtime [run] [flags] -- <command> [args...]
   loch-lambda-runtime [run] [flags] <handler>     (= /lambda-entrypoint.sh <handler>)
   loch-lambda-runtime health [flags]
-  loch-lambda-runtime invoke [flags] [--timeout <s>] [--log-tail] < event.json
+  loch-lambda-runtime invoke [flags] [--timeout <s>] [--log-tail] [--watch-stdin] < event.json
   loch-lambda-runtime version`
 
 // ErrHelp is returned when -h or --help was requested.
@@ -62,6 +62,10 @@ type Invoke struct {
 	// Timeout bounds the whole call: queue wait and execution.
 	Timeout time.Duration
 	LogTail bool
+	// WatchStdin reads the event as the first JSON value on stdin, then
+	// takes stdin closing as the caller going away (docker exec closes the
+	// process's stdin when its client disconnects).
+	WatchStdin bool
 }
 
 // Env abstracts the process environment for tests.

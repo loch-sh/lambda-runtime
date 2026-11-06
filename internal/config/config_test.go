@@ -437,22 +437,23 @@ func TestLargeQueueBytes(t *testing.T) {
 // parseRuntime: each setting given an invalid value must be reported.
 func TestEverySettingIsRead(t *testing.T) {
 	invalid := map[string]string{
-		"LOCH_RUNTIME_INVOKE_ADDR":     "nope",
-		"LOCH_RUNTIME_API_ADDR":        "nope",
-		"LOCH_RUNTIME_HEALTH_ADDR":     "0.0.0.0:8081",
-		"LOCH_RUNTIME_BOOTSTRAP":       "relative",
-		"LOCH_RUNTIME_WORKDIR":         "relative",
-		"LOCH_RUNTIME_INIT_TIMEOUT":    "nope",
-		"LOCH_RUNTIME_SHUTDOWN_GRACE":  "nope",
-		"LOCH_RUNTIME_MAX_PAYLOAD":     "nope",
-		"LOCH_RUNTIME_QUEUE_SIZE":      "nope",
-		"LOCH_RUNTIME_QUEUE_BYTES":     "nope",
-		"LOCH_RUNTIME_QUEUE_TIMEOUT":   "nope",
-		"LOCH_RUNTIME_MAX_CONNS":       "nope",
-		"LOCH_RUNTIME_AUTH":            "nope",
-		"LOCH_RUNTIME_TOKEN_FILE":      "relative",
-		"LOCH_RUNTIME_ACCESS_KEY_FILE": "relative",
-		"LOCH_RUNTIME_LOG_LEVEL":       "nope",
+		"LOCH_RUNTIME_INVOKE_ADDR":       "nope",
+		"LOCH_RUNTIME_API_ADDR":          "nope",
+		"LOCH_RUNTIME_HEALTH_ADDR":       "0.0.0.0:8081",
+		"LOCH_RUNTIME_BOOTSTRAP":         "relative",
+		"LOCH_RUNTIME_WORKDIR":           "relative",
+		"LOCH_RUNTIME_INIT_TIMEOUT":      "nope",
+		"LOCH_RUNTIME_SHUTDOWN_GRACE":    "nope",
+		"LOCH_RUNTIME_MAX_PAYLOAD":       "nope",
+		"LOCH_RUNTIME_QUEUE_SIZE":        "nope",
+		"LOCH_RUNTIME_QUEUE_BYTES":       "nope",
+		"LOCH_RUNTIME_QUEUE_TIMEOUT":     "nope",
+		"LOCH_RUNTIME_MAX_CONNS":         "nope",
+		"LOCH_RUNTIME_AUTH":              "nope",
+		"LOCH_RUNTIME_TOKEN_FILE":        "relative",
+		"LOCH_RUNTIME_TOKEN_SHA256_FILE": "relative",
+		"LOCH_RUNTIME_ACCESS_KEY_FILE":   "relative",
+		"LOCH_RUNTIME_LOG_LEVEL":         "nope",
 	}
 	if len(invalid) != len(settings) {
 		t.Fatalf("%d settings, %d tested", len(settings), len(invalid))
@@ -519,7 +520,10 @@ func TestCredentialErrors(t *testing.T) {
 		env  mapEnv
 		want string
 	}{
-		{mapEnv{"LOCH_RUNTIME_TOKEN": testToken, "LOCH_RUNTIME_TOKEN_FILE": "/t"}, "both set"},
+		{mapEnv{"LOCH_RUNTIME_TOKEN": testToken, "LOCH_RUNTIME_TOKEN_FILE": "/t"}, "several sources"},
+		{mapEnv{"LOCH_RUNTIME_TOKEN_SHA256": strings.Repeat("a", 64), "LOCH_RUNTIME_TOKEN_SHA256_FILE": "/h"}, "several sources"},
+		{mapEnv{"LOCH_RUNTIME_TOKEN_SHA256": "abc"}, "64 hexadecimal"},
+		{mapEnv{"LOCH_RUNTIME_TOKEN_SHA256": strings.Repeat("z", 64)}, "64 hexadecimal"},
 		{mapEnv{"LOCH_RUNTIME_ACCESS_KEY": "a:b", "LOCH_RUNTIME_ACCESS_KEY_FILE": "/k"}, "both set"},
 		{mapEnv{"LOCH_RUNTIME_TOKEN": "short"}, "at least 32"},
 		{mapEnv{"LOCH_RUNTIME_TOKEN": testToken + " x"}, "printable"},
@@ -583,22 +587,23 @@ func TestChildSeesTrimmedValues(t *testing.T) {
 // value, by environment then by flag, and checks the destination field.
 func TestSettingsLandInTheirField(t *testing.T) {
 	values := map[string]string{
-		"invoke-addr":      "127.0.0.1:8081",
-		"runtime-api-addr": "127.0.0.2:9002",
-		"health-addr":      "127.0.0.3:8082",
-		"bootstrap":        "/b",
-		"workdir":          "/w",
-		"init-timeout":     "11",
-		"shutdown-grace":   "12",
-		"max-payload":      "2048",
-		"queue-size":       "13",
-		"queue-bytes":      "4096",
-		"queue-timeout":    "14",
-		"max-conns":        "15",
-		"auth":             "off",
-		"token-file":       "/t",
-		"access-key-file":  "/k",
-		"log-level":        "debug",
+		"invoke-addr":       "127.0.0.1:8081",
+		"runtime-api-addr":  "127.0.0.2:9002",
+		"health-addr":       "127.0.0.3:8082",
+		"bootstrap":         "/b",
+		"workdir":           "/w",
+		"init-timeout":      "11",
+		"shutdown-grace":    "12",
+		"max-payload":       "2048",
+		"queue-size":        "13",
+		"queue-bytes":       "4096",
+		"queue-timeout":     "14",
+		"max-conns":         "15",
+		"auth":              "off",
+		"token-file":        "/t",
+		"token-sha256-file": "/h",
+		"access-key-file":   "/k",
+		"log-level":         "debug",
 	}
 	check := func(t *testing.T, rt Runtime) {
 		t.Helper()
@@ -619,6 +624,9 @@ func TestSettingsLandInTheirField(t *testing.T) {
 		if !ok {
 			t.Fatalf("no test value for --%s", s.flag)
 		}
+		if s.flag == "token-sha256-file" {
+			continue // another bearer source than token-file: checked below
+		}
 		env[s.env] = v
 		args = append(args, "--"+s.flag+"="+v)
 	}
@@ -631,11 +639,37 @@ func TestSettingsLandInTheirField(t *testing.T) {
 	// The same values by flag win over different environment values.
 	other := mapEnv{}
 	for _, s := range settings {
-		other[s.env] = "garbage that would fail"
+		if s.flag != "token-sha256-file" {
+			other[s.env] = "garbage that would fail"
+		}
 	}
 	cfg, err = Parse(append(args, "h"), sources(t, other, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	check(t, cfg.Runtime)
+
+	cfg, err = Parse([]string{"--token-sha256-file", values["token-sha256-file"], "h"}, sources(t, nil, ""))
+	if err != nil || cfg.Runtime.Auth.TokenSHA256File != "/h" {
+		t.Errorf("token-sha256-file: %+v %v", cfg, err)
+	}
+}
+
+func TestTokenSHA256(t *testing.T) {
+	sum := strings.Repeat("ab", 32)
+	cfg, err := Parse([]string{"h"}, sources(t, mapEnv{"LOCH_RUNTIME_AUTH": "on", "LOCH_RUNTIME_TOKEN_SHA256": sum}, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.Runtime.Auth
+	if a.TokenSHA256 != sum || !a.HasBearer() || a.HasAccessKey() {
+		t.Errorf("auth = %+v", a)
+	}
+	if _, n := envValue(cfg.ChildEnv, "LOCH_RUNTIME_TOKEN_SHA256"); n != 0 {
+		t.Error("hash passed to the child")
+	}
+	got, err := ParseTokenSHA256(sum)
+	if err != nil || got[0] != 0xab {
+		t.Errorf("parse = %x %v", got, err)
+	}
 }

@@ -145,15 +145,73 @@ func TestRunServesAndStops(t *testing.T) {
 	}
 }
 
-func TestRunRefusesAuthenticationForNow(t *testing.T) {
+func TestRunRefusesBadCredentials(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Runtime.Auth.Enabled = true
+	cfg.Runtime.Auth = config.Auth{Enabled: true, TokenFile: "/nonexistent/token"}
 	var stderr syncBuffer
 	if code := Run(cfg, Env{Stdout: io.Discard, Stderr: &stderr}); code != 1 {
 		t.Errorf("code = %d", code)
 	}
-	if !strings.Contains(stderr.String(), "not implemented") {
+	if !strings.Contains(stderr.String(), "startup refused") {
 		t.Errorf("stderr = %s", stderr.String())
+	}
+}
+
+func TestRunWithAuthenticationAndMetrics(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef"
+	cfg := testConfig(t)
+	cfg.Runtime.Auth = config.Auth{Enabled: true, Token: token}
+	ctx, cancel := context.WithCancel(context.Background())
+	code := make(chan int, 1)
+	go func() {
+		code <- Run(cfg, Env{Stdout: io.Discard, Stderr: io.Discard, CgroupRoot: t.TempDir(), Signals: ctx, Version: "v9"})
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for Health(cfg, io.Discard) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("never healthy")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	base := "http://" + cfg.Runtime.InvokeAddr
+	do := func(method, path, auth string) int {
+		req, _ := http.NewRequest(method, base+path, strings.NewReader(`{}`))
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// The test calls from the loopback, exempt from authentication (the
+	// remote case is covered by invokeapi and the integration tests).
+	invoke := "/2015-03-31/functions/function/invocations"
+	if got := do("POST", invoke, ""); got != 200 {
+		t.Errorf("loopback without credential: %d", got)
+	}
+	if got := do("POST", invoke, "Bearer "+token); got != 200 {
+		t.Errorf("bearer: %d", got)
+	}
+	req, _ := http.NewRequest("GET", base+"/_loch/metrics", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{`loch_lambda_runtime_info{version="v9"} 1`, `loch_lambda_invocations_total{outcome="success"} 2`,
+		"loch_lambda_auth_failures_total 0", `loch_lambda_state{state="ready"} 1`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("metrics lack %q:\n%s", want, body)
+		}
+	}
+	cancel()
+	if c := <-code; c != 0 {
+		t.Errorf("exit code = %d", c)
 	}
 }
 
@@ -194,19 +252,5 @@ func TestHealth(t *testing.T) {
 	cfg.Runtime.HealthAddr = "127.0.0.1:" + freePort(t)
 	if code := Health(cfg, io.Discard); code != 1 {
 		t.Errorf("unreachable: %d", code)
-	}
-}
-
-func TestLocalAddr(t *testing.T) {
-	for in, want := range map[string]string{
-		"0.0.0.0:8080":  "127.0.0.1:8080",
-		":8080":         "127.0.0.1:8080",
-		"[::]:8080":     "127.0.0.1:8080",
-		"10.0.0.2:8080": "10.0.0.2:8080",
-		"garbage":       "garbage",
-	} {
-		if got := localAddr(in); got != want {
-			t.Errorf("localAddr(%q) = %q, want %q", in, got, want)
-		}
 	}
 }

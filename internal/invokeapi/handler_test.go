@@ -10,10 +10,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"github.com/loch-sh/lambda-runtime/internal/auth"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"runtime"
 	"strings"
 	"testing"
@@ -249,8 +251,8 @@ func TestDryRun(t *testing.T) {
 	if resp.StatusCode != 204 {
 		t.Errorf("status %d", resp.StatusCode)
 	}
-	if s := f.q.Stats(); s.Peak != 0 {
-		t.Error("DryRun must not queue anything")
+	if s := f.q.Stats(); s.Depth != 0 || s.Bytes != 0 {
+		t.Errorf("DryRun must not queue anything: %+v", s)
 	}
 }
 
@@ -338,19 +340,19 @@ func TestClientGoneWhileQueued(t *testing.T) {
 
 type denyAll struct{}
 
-func (denyAll) Authenticate(*http.Request) error {
-	return &awsError{status: 401, name: "UnrecognizedClientException", message: "no"}
+func (denyAll) Authenticate(*http.Request) (auth.BodyCheck, error) {
+	return nil, &auth.Error{Status: 401, Name: "MissingAuthenticationTokenException", Message: "no"}
 }
 
 func TestAuthenticatorRunsFirst(t *testing.T) {
 	f := newFixture(t, Options{Auth: denyAll{}}, echo)
 	resp, body := f.do("POST", invokePath, strings.Repeat("x", 5000), nil)
-	wantAWSError(t, resp, body, 401, "UnrecognizedClientException")
+	wantAWSError(t, resp, body, 401, "MissingAuthenticationTokenException")
 }
 
 type brokenAuth struct{}
 
-func (brokenAuth) Authenticate(*http.Request) error { return errors.New("bug") }
+func (brokenAuth) Authenticate(*http.Request) (auth.BodyCheck, error) { return nil, errors.New("bug") }
 
 func TestUnexpectedErrorIs500(t *testing.T) {
 	f := newFixture(t, Options{Auth: brokenAuth{}}, echo)
@@ -547,5 +549,170 @@ func TestEmptyTailOmitted(t *testing.T) {
 	resp, _ := f.do("POST", invokePath, `{}`, http.Header{"X-Amz-Log-Type": {"Tail"}})
 	if _, ok := resp.Header["X-Amz-Log-Result"]; ok {
 		t.Error("empty log tail sent")
+	}
+}
+
+// bodyAuth accepts the request, then refuses bodies other than "good".
+type bodyAuth struct{}
+
+func (bodyAuth) Authenticate(*http.Request) (auth.BodyCheck, error) {
+	return func(body []byte) error {
+		if string(body) != "good" {
+			return &auth.Error{Status: 403, Name: "InvalidSignatureException", Message: "bad"}
+		}
+		return nil
+	}, nil
+}
+
+func TestBodyCheck(t *testing.T) {
+	f := newFixture(t, Options{Auth: bodyAuth{}}, echo)
+	resp, body := f.do("POST", invokePath, "evil", nil)
+	wantAWSError(t, resp, body, 403, "InvalidSignatureException")
+	if s := f.q.Stats(); s.Depth != 0 || s.Bytes != 0 {
+		t.Errorf("refused body kept its reservation: %+v", s)
+	}
+	if resp, _ := f.do("POST", invokePath, "good", nil); resp.StatusCode != 200 {
+		t.Errorf("good body: %d", resp.StatusCode)
+	}
+}
+
+type countObserver struct{ throttled, authFailed int }
+
+func (c *countObserver) Throttled()  { c.throttled++ }
+func (c *countObserver) AuthFailed() { c.authFailed++ }
+
+type fixedMetrics string
+
+func (m fixedMetrics) WriteTo(w io.Writer) (int64, error) {
+	n, err := io.WriteString(w, string(m))
+	return int64(n), err
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	obs := &countObserver{}
+	f := newFixture(t, Options{QueueTimeout: 10 * time.Millisecond, Observer: obs, Metrics: fixedMetrics("m 1\n")}, nil)
+	resp, body := f.do("GET", "/_loch/metrics", "", nil)
+	if resp.StatusCode != 200 || string(body) != "m 1\n" || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+		t.Errorf("metrics = %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := f.do("POST", "/_loch/metrics", "", nil); resp.StatusCode != 405 {
+		t.Errorf("POST metrics = %d", resp.StatusCode)
+	}
+	f.do("POST", invokePath, `{}`, nil) // queue timeout: throttled
+	if obs.throttled != 1 {
+		t.Errorf("throttled = %d", obs.throttled)
+	}
+	denied := newFixture(t, Options{Auth: denyAll{}, Metrics: fixedMetrics("x")}, nil)
+	resp, body = denied.do("GET", "/_loch/metrics", "", nil)
+	wantAWSError(t, resp, body, 401, "MissingAuthenticationTokenException")
+	none := newFixture(t, Options{}, nil)
+	resp, body = none.do("GET", "/_loch/metrics", "", nil)
+	wantAWSError(t, resp, body, 404, "ResourceNotFoundException")
+	// The body check of a SigV4 GET runs on an empty body.
+	checked := newFixture(t, Options{Auth: bodyAuth{}, Metrics: fixedMetrics("x")}, nil)
+	resp, body = checked.do("GET", "/_loch/metrics", "", nil)
+	wantAWSError(t, resp, body, 403, "InvalidSignatureException")
+}
+
+func TestAuthFailureClosesAndCounts(t *testing.T) {
+	obs := &countObserver{}
+	f := newFixture(t, Options{Auth: bodyAuth{}, Observer: obs}, echo)
+	resp, body := f.do("POST", invokePath, "evil", nil)
+	wantAWSError(t, resp, body, 403, "InvalidSignatureException")
+	if !resp.Close || obs.authFailed != 1 {
+		t.Errorf("close=%v failures=%d", resp.Close, obs.authFailed)
+	}
+	denied := newFixture(t, Options{Auth: denyAll{}, Observer: obs}, echo)
+	resp, _ = denied.do("POST", invokePath, "{}", nil)
+	if !resp.Close || obs.authFailed != 2 {
+		t.Errorf("close=%v failures=%d", resp.Close, obs.authFailed)
+	}
+}
+
+func TestLogLimiter(t *testing.T) {
+	l := newLogLimiter()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return now }
+	if !l.allow("10.0.0.1:1") || l.allow("10.0.0.1:2") || !l.allow("10.0.0.2:1") {
+		t.Fatal("first log per IP only")
+	}
+	now = now.Add(logEvery)
+	if !l.allow("10.0.0.1:3") {
+		t.Error("allowed again after a minute")
+	}
+	if l.allow("garbage") {
+		t.Error("unparsable address logged")
+	}
+	// The map stays bounded.
+	for i := range maxLoggedIPs + 10 {
+		l.allow(netip.AddrFrom4([4]byte{10, 1, byte(i >> 8), byte(i)}).String() + ":1")
+	}
+	if len(l.last) > maxLoggedIPs {
+		t.Errorf("limiter holds %d IPs", len(l.last))
+	}
+	if !l.allow("10.9.9.9:1") {
+		t.Error("a new IP must still be logged when the table is full")
+	}
+}
+
+func TestDryRunVerifiesTheBody(t *testing.T) {
+	f := newFixture(t, Options{Auth: bodyAuth{}}, nil)
+	resp, body := f.do("POST", invokePath, "evil", http.Header{"X-Amz-Invocation-Type": {"DryRun"}})
+	wantAWSError(t, resp, body, 403, "InvalidSignatureException")
+	resp, _ = f.do("POST", invokePath, "good", http.Header{"X-Amz-Invocation-Type": {"DryRun"}})
+	if resp.StatusCode != 204 {
+		t.Errorf("good DryRun: %d", resp.StatusCode)
+	}
+	if s := f.q.Stats(); s.Depth != 0 || s.Bytes != 0 {
+		t.Errorf("DryRun kept room: %+v", s)
+	}
+}
+
+func TestLoopbackWithoutAuth(t *testing.T) {
+	// The test server is on the loopback: exempt when enabled.
+	f := newFixture(t, Options{Auth: denyAll{}, LoopbackWithoutAuth: true, Metrics: fixedMetrics("m")}, echo)
+	if resp, _ := f.do("POST", invokePath, `{}`, nil); resp.StatusCode != 200 {
+		t.Errorf("loopback invoke: %d", resp.StatusCode)
+	}
+	if resp, _ := f.do("GET", "/_loch/metrics", "", nil); resp.StatusCode != 200 {
+		t.Errorf("loopback metrics: %d", resp.StatusCode)
+	}
+	// A non-loopback caller still needs the credential.
+	h := NewHandler(Options{Auth: denyAll{}, LoopbackWithoutAuth: true, Queue: f.q, MaxPayload: 1024,
+		Function: FunctionName{Name: "f", Region: "r"}, State: func() engine.State { return engine.StateReady },
+		Log: slog.New(slog.DiscardHandler)})
+	req := httptest.NewRequest("POST", invokePath, strings.NewReader(`{}`))
+	req.RemoteAddr = "10.0.0.9:1234"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Errorf("remote caller: %d", rec.Code)
+	}
+	for addr, want := range map[string]bool{"127.0.0.1:1": true, "[::1]:1": true, "[::ffff:127.0.0.1]:1": true, "10.0.0.1:1": false, "x": false} {
+		if isLoopback(addr) != want {
+			t.Errorf("isLoopback(%s) != %v", addr, want)
+		}
+	}
+}
+
+func TestUnverifiedBodiesUseTheirOwnBudget(t *testing.T) {
+	q := queue.New(10, 1<<20)
+	q.SetUnverifiedLimits(queue.UnverifiedLimits{Bytes: 100, PerIP: 100})
+	f := newFixture(t, Options{Auth: bodyAuth{}, Queue: q}, echo)
+	// Larger than the unverified budget: refused before reading.
+	resp, body := f.do("POST", invokePath, strings.Repeat("x", 200), nil)
+	wantAWSError(t, resp, body, 429, "TooManyRequestsException")
+	// Within it: accepted once verified, and the budget is given back.
+	if resp, _ := f.do("POST", invokePath, "good", nil); resp.StatusCode != 200 {
+		t.Errorf("good: %d", resp.StatusCode)
+	}
+	if got := q.UnverifiedBytes(); got != 0 {
+		t.Errorf("unverified bytes left: %d", got)
+	}
+	if got := remoteIP("[::ffff:10.0.0.1]:5"); got != "10.0.0.1" {
+		t.Errorf("remoteIP = %s", got)
+	}
+	if got := remoteIP("garbage"); got != "garbage" {
+		t.Errorf("remoteIP = %s", got)
 	}
 }

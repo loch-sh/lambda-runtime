@@ -53,7 +53,7 @@ func errRouteNotFound() *awsError {
 }
 
 func errMethod() *awsError {
-	return &awsError{status: http.StatusMethodNotAllowed, name: "MethodNotAllowedException", message: "Only POST invokes a function"}
+	return &awsError{status: http.StatusMethodNotAllowed, name: "MethodNotAllowedException", message: "Method not allowed"}
 }
 
 func errTooLarge(limit int64) *awsError {

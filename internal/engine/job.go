@@ -43,6 +43,9 @@ const (
 	KindInitError Kind = "init_error"
 )
 
+// Kinds lists every result kind, for the metrics.
+var Kinds = []Kind{KindSuccess, KindError, KindTimeout, KindExit, KindOOM, KindTooLarge, KindInitError}
+
 // Result is the answer to an invocation. Every kind but KindSuccess is a
 // function error (X-Amz-Function-Error: Unhandled).
 type Result struct {

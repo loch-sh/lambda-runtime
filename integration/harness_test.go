@@ -90,6 +90,14 @@ type runOptions struct {
 	env    []string
 	// cmd replaces the image handler shortcut.
 	cmd []string
+	// code replaces the image's test function directory (absolute path).
+	code string
+	// auth keeps authentication on (the credentials come with env).
+	auth bool
+	// network and alias attach the container to a test network.
+	network, alias string
+	// mounts are extra -v volumes.
+	mounts []string
 }
 
 // start runs img under the production hardening, the Invoke API published
@@ -99,9 +107,12 @@ func start(t *testing.T, img image, o runOptions) *container {
 	if o.memory == "" {
 		o.memory = "256m"
 	}
-	code, err := filepath.Abs(filepath.Join("testdata", img.code))
-	if err != nil {
-		t.Fatal(err)
+	code := o.code
+	if code == "" {
+		var err error
+		if code, err = filepath.Abs(filepath.Join("testdata", img.code)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	name := fmt.Sprintf("lr-it-%s-%d", img.name, time.Now().UnixNano())
 	args := []string{"run", "-d", "--name", name,
@@ -110,9 +121,17 @@ func start(t *testing.T, img image, o runOptions) *container {
 		"-p", "127.0.0.1::8080",
 		"-v", runtimeBinary(t) + ":/loch/lambda-runtime:ro",
 		"-v", code + ":/var/task:ro",
-		"-e", "LOCH_RUNTIME_AUTH=off",
 		"-e", "AWS_LAMBDA_FUNCTION_TIMEOUT=3",
 		"--entrypoint", "/loch/lambda-runtime",
+	}
+	if !o.auth {
+		args = append(args, "-e", "LOCH_RUNTIME_AUTH=off")
+	}
+	for _, m := range o.mounts {
+		args = append(args, "-v", m)
+	}
+	if o.network != "" {
+		args = append(args, "--network", o.network, "--network-alias", o.alias)
 	}
 	for _, e := range o.env {
 		args = append(args, "-e", e)
@@ -220,4 +239,41 @@ func (r response) String() string {
 func (c *container) dockerExec(args ...string) (string, error) {
 	out, err := exec.Command("docker", append([]string{"exec", c.name}, args...)...).CombinedOutput()
 	return string(out), err
+}
+
+// network creates a Docker network for the test.
+func network(t *testing.T) string {
+	t.Helper()
+	name := fmt.Sprintf("lr-it-net-%d", time.Now().UnixNano())
+	docker(t, "network", "create", name)
+	t.Cleanup(func() { _, _ = exec.Command("docker", "network", "rm", name).CombinedOutput() })
+	return name
+}
+
+// invokeWith sends an invocation with extra headers and an arbitrary
+// method and body.
+func (c *container) invokeWith(method, path string, body []byte, header http.Header) response {
+	c.t.Helper()
+	r, err := c.tryInvokeWith(method, path, body, header)
+	if err != nil {
+		c.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return r
+}
+
+// tryInvokeWith is invokeWith returning transport errors, for goroutines.
+func (c *container) tryInvokeWith(method, path string, body []byte, header http.Header) (response, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, method, c.url+path, bytes.NewReader(body))
+	for k, v := range header {
+		req.Header[k] = v
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return response{}, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return response{resp.StatusCode, b, resp.Header.Get("X-Amz-Function-Error"), "", resp.Header}, nil
 }

@@ -3,6 +3,10 @@ import os
 import threading
 import time
 
+# A slow init, on demand.
+if os.environ.get("INIT_SLEEP_MS"):
+    time.sleep(int(os.environ["INIT_SLEEP_MS"]) / 1000)
+
 
 def handler(event, context):
     op = event.get("op")
@@ -20,6 +24,8 @@ def handler(event, context):
         keep = []
         while True:
             keep.append(bytearray(8 * 1024 * 1024))
+    if op == "big-response":
+        return "x" * (7 * 1024 * 1024)
     if op == "environ":
         try:
             open("/proc/1/environ", "rb").read()

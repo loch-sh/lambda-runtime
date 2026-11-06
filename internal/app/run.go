@@ -22,6 +22,7 @@ import (
 	"github.com/loch-sh/lambda-runtime/internal/engine"
 	"github.com/loch-sh/lambda-runtime/internal/invokeapi"
 	"github.com/loch-sh/lambda-runtime/internal/logs"
+	"github.com/loch-sh/lambda-runtime/internal/metrics"
 	"github.com/loch-sh/lambda-runtime/internal/netutil"
 	"github.com/loch-sh/lambda-runtime/internal/process"
 	"github.com/loch-sh/lambda-runtime/internal/queue"
@@ -34,11 +35,6 @@ const (
 	runtimeAPIConns = 16
 	// healthConns caps the connections to the health listener.
 	healthConns = 4
-	// connsPerIP caps the open Invoke API connections of one source IP
-	// (loopback exempt), idle keep-alive ones included, so that one client
-	// cannot hold the whole connection cap. The requests in flight are
-	// capped separately, per IP, at the queue size + 1.
-	connsPerIP = 64
 	// minBodyRate sets the deadline of a request upload (bytes/s): 6 MiB
 	// must arrive within 5 s + 6 s on the internal Docker network.
 	minBodyRate = 1 << 20
@@ -48,89 +44,124 @@ const (
 
 // Env is what Run needs from the process, replaceable in tests.
 type Env struct {
+	// Version is reported by the metrics.
+	Version        string
 	Stdout, Stderr io.Writer
 	CgroupRoot     string
 	// Signals delivers the shutdown signals; nil means SIGTERM and SIGINT.
 	Signals context.Context
+	// HardenErr is the result of process.Harden, run first by main.
+	HardenErr error
 }
 
 // Run runs the function until SIGTERM and returns the exit code.
 func Run(cfg *config.Config, env Env) int {
 	relay := logs.NewRelay(env.Stdout, env.Stderr)
 	log := newLogger(relay, cfg.Runtime.LogLevel)
-	if err := secure(cfg, log); err != nil {
+	store, authenticator, err := secure(cfg, env.HardenErr, log)
+	if err != nil {
 		log.Error("startup refused", "error", err)
 		return 1
 	}
 	logStartup(cfg, log)
 
-	ctx := env.Signals
-	if ctx == nil {
-		var stop context.CancelFunc
-		ctx, stop = signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-		defer stop()
+	ctx, stop := shutdownContext(env)
+	defer stop()
+	if store != nil {
+		stopReload := reloadOnSIGHUP(store, log)
+		defer stopReload()
 	}
-
-	reaper := process.NewReaper(log)
-	defer reaper.Close()
-	events := make(chan runtimeapi.Event, 16)
-	machine := runtimeapi.NewMachine(events)
-	runtimeSrv, err := serveRuntimeAPI(cfg, machine, log)
+	parts, err := start(cfg, env, relay, authenticator, log)
 	if err != nil {
-		log.Error("runtime api not started", "error", err)
+		log.Error("not started", "error", err)
 		return 1
 	}
-	defer runtimeSrv.Close()
+	defer parts.close()
+	parts.serveUntil(ctx, log)
+	log.Info("stopped")
+	return 0
+}
 
-	q := queue.New(cfg.Runtime.QueueSize, cfg.Runtime.QueueBytes)
+// shutdownContext ends on SIGTERM or SIGINT, or with env.Signals in tests.
+func shutdownContext(env Env) (context.Context, context.CancelFunc) {
+	if env.Signals != nil {
+		return env.Signals, func() {}
+	}
+	return signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+}
+
+// parts are the running components.
+type parts struct {
+	reaper                           *process.Reaper
+	queue                            *queue.Queue
+	engine                           *engine.Engine
+	runtimeSrv, invokeSrv, healthSrv *http.Server
+}
+
+// start builds the components and starts the servers; the bootstrap
+// starts with serveUntil.
+func start(cfg *config.Config, env Env, relay *logs.Relay, authenticator invokeapi.Authenticator, log *slog.Logger) (*parts, error) {
+	p := &parts{reaper: process.NewReaper(log)}
+	events := make(chan runtimeapi.Event, 16)
+	machine := runtimeapi.NewMachine(events)
+	var err error
+	if p.runtimeSrv, err = serveRuntimeAPI(cfg, machine, log); err != nil {
+		p.close()
+		return nil, fmt.Errorf("runtime api: %w", err)
+	}
+	p.queue = queue.New(cfg.Runtime.QueueSize, cfg.Runtime.QueueBytes)
+	// Bodies of requests not authenticated yet (SigV4 without a payload
+	// hash header): a quarter of the budget, one maximum body per IP.
+	p.queue.SetUnverifiedLimits(queue.UnverifiedLimits{
+		Bytes: max(cfg.Runtime.QueueBytes/4, cfg.Runtime.MaxPayload),
+		PerIP: cfg.Runtime.MaxPayload,
+	})
 	opts := engineOptions(cfg, env, log)
 	if !opts.Memory.Available() {
 		log.Warn("cgroup memory files not readable: no Max Memory Used, no OOM detection")
 	}
-	eng := engine.New(opts, engine.Dependencies{
-		Machine: machine, Events: events, Reaper: reaper, Relay: relay, Source: q,
+	collector := metrics.New(env.Version, func() (int, int) {
+		s := p.queue.Stats()
+		return s.Depth, s.Peak
+	}, opts.Memory.PeakBytes)
+	opts.Observer = collector
+	p.engine = engine.New(opts, engine.Dependencies{
+		Machine: machine, Events: events, Reaper: p.reaper, Relay: relay, Source: p.queue,
 	}, os.Getpid())
-	invokeSrv, healthSrv, err := serveInvokeAPI(cfg, q, eng, log)
-	if err != nil {
-		log.Error("invoke api not started", "error", err)
-		return 1
+	if p.invokeSrv, p.healthSrv, err = serveInvokeAPI(cfg, p.queue, p.engine, authenticator, collector, log); err != nil {
+		p.close()
+		return nil, fmt.Errorf("invoke api: %w", err)
 	}
-	defer healthSrv.Close()
+	return p, nil
+}
 
+// serveUntil runs the bootstrap until ctx ends, then shuts down: queued
+// requests get 503, the engine stops the bootstrap, the last responses
+// are flushed.
+func (p *parts) serveUntil(ctx context.Context, log *slog.Logger) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		eng.Run(ctx)
+		p.engine.Run(ctx)
 	}()
 	<-ctx.Done()
 	log.Info("shutdown requested")
-	for _, job := range q.Close() {
+	for _, job := range p.queue.Close() {
 		job.Fail(engine.ErrShuttingDown)
 	}
 	<-done
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), httpShutdown)
 	defer cancel()
-	_ = invokeSrv.Shutdown(shutdownCtx)
-	log.Info("stopped")
-	return 0
+	_ = p.invokeSrv.Shutdown(shutdownCtx)
 }
 
-// secure hardens the process before anything else runs: non-dumpable
-// (the child cannot read our environment or memory), credentials removed
-// from our environment.
-func secure(cfg *config.Config, log *slog.Logger) error {
-	if err := process.Harden(); err != nil {
-		log.Warn("process not made non-dumpable", "error", err)
+func (p *parts) close() {
+	for _, srv := range []*http.Server{p.healthSrv, p.invokeSrv, p.runtimeSrv} {
+		if srv != nil {
+			_ = srv.Close()
+		}
 	}
-	for _, key := range config.SecretEnv {
-		_ = os.Unsetenv(key)
-	}
-	if cfg.Runtime.Auth.Enabled {
-		// The authenticator comes with the next step of v1.
-		return errors.New("authentication is not implemented yet: set LOCH_RUNTIME_AUTH=off")
-	}
-	log.Warn("authentication is off: anyone who can reach the Invoke API can invoke the function")
-	return nil
+	p.reaper.Close()
 }
 
 func newLogger(relay *logs.Relay, level string) *slog.Logger {
@@ -182,9 +213,11 @@ func serveRuntimeAPI(cfg *config.Config, m *runtimeapi.Machine, log *slog.Logger
 	return srv, nil
 }
 
-// serveInvokeAPI serves the Invoke API (with health) on InvokeAddr, and
-// health alone on the loopback HealthAddr used by the health subcommand.
-func serveInvokeAPI(cfg *config.Config, q *queue.Queue, eng *engine.Engine, log *slog.Logger) (invoke, health *http.Server, err error) {
+// serveInvokeAPI serves the Invoke API (with health and metrics) on
+// InvokeAddr, and health alone on the loopback HealthAddr used by the
+// health subcommand. authenticator is nil when authentication is off.
+func serveInvokeAPI(cfg *config.Config, q *queue.Queue, eng *engine.Engine, authenticator invokeapi.Authenticator,
+	collector *metrics.Collector, log *slog.Logger) (invoke, health *http.Server, err error) {
 	ln, err := net.Listen("tcp", cfg.Runtime.InvokeAddr)
 	if err != nil {
 		return nil, nil, err
@@ -202,20 +235,30 @@ func serveInvokeAPI(cfg *config.Config, q *queue.Queue, eng *engine.Engine, log 
 		MinBodyRate:  minBodyRate,
 		// One caller may fill the queue (1 running + QueueSize waiting),
 		// not more.
-		MaxInFlightPerIP: cfg.Runtime.QueueSize + 1,
-		RetryAfter:       eng.RetryAfter,
-		Queue:            q,
-		State:            eng.State,
-		Log:              log,
+		MaxInFlightPerIP:    cfg.Runtime.QueueSize + 1,
+		RetryAfter:          eng.RetryAfter,
+		Auth:                authenticator,
+		LoopbackWithoutAuth: true,
+		Observer:            collector,
+		Metrics:             collector,
+		Queue:               q,
+		State:               eng.State,
+		Log:                 log,
 	})
 	invoke = invokeapi.NewServer(h, log)
-	go serve(invoke, netutil.LimitListener(netutil.PerIPLimitListener(ln, connsPerIP, invokeapi.ThrottledResponse), cfg.Runtime.MaxConns), log)
+	go serve(invoke, netutil.LimitListener(netutil.PerIPLimitListener(ln, connsPerIP(cfg.Runtime.MaxConns), invokeapi.ThrottledResponse, collector.Throttled), cfg.Runtime.MaxConns), log)
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/_loch/health", h.Health)
 	health = invokeapi.NewServer(healthMux, log)
 	go serve(health, netutil.LimitListener(healthLn, healthConns), log)
 	return invoke, health, nil
 }
+
+// connsPerIP caps the open Invoke API connections of one source IP
+// (loopback exempt), idle keep-alive ones included, at half the global
+// cap, so that one client cannot hold every slot. The requests in flight
+// are capped separately, per IP, at the queue size + 1.
+func connsPerIP(maxConns int) int { return max(1, maxConns/2) }
 
 func serve(srv *http.Server, ln net.Listener, log *slog.Logger) {
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {

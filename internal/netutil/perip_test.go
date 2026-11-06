@@ -47,8 +47,9 @@ func (c *fakeConn) RemoteAddr() net.Addr {
 func (c *fakeConn) Close() error { c.closed = true; return nil }
 
 func TestPerIPLimit(t *testing.T) {
+	refusedCount := 0
 	fl := &fakeListener{conns: make(chan net.Conn, 10)}
-	l := PerIPLimitListener(fl, 2, []byte("no"))
+	l := PerIPLimitListener(fl, 2, []byte("no"), func() { refusedCount++ })
 	a1, a2, a3 := &fakeConn{remote: "10.0.0.5:1"}, &fakeConn{remote: "10.0.0.5:2"}, &fakeConn{remote: "10.0.0.5:3"}
 	b1 := &fakeConn{remote: "10.0.0.6:1"}
 	for _, c := range []net.Conn{a1, a2, a3, b1} {
@@ -58,7 +59,7 @@ func TestPerIPLimit(t *testing.T) {
 	got2, _ := l.Accept()
 	// The third connection of 10.0.0.5 is closed; the next accepted is b1.
 	got3, _ := l.Accept()
-	if !a3.closed || string(a3.written) != "no" || got3.RemoteAddr().String() != "10.0.0.6:1" {
+	if !a3.closed || string(a3.written) != "no" || refusedCount != 1 || got3.RemoteAddr().String() != "10.0.0.6:1" {
 		t.Fatalf("a3 closed=%v, accepted %s", a3.closed, got3.RemoteAddr())
 	}
 	// Closing one (twice) frees one slot for 10.0.0.5.
@@ -74,7 +75,7 @@ func TestPerIPLimit(t *testing.T) {
 
 func TestPerIPLoopbackExempt(t *testing.T) {
 	fl := &fakeListener{conns: make(chan net.Conn, 10)}
-	l := PerIPLimitListener(fl, 1, nil)
+	l := PerIPLimitListener(fl, 1, nil, nil)
 	for i := range 5 {
 		c := &fakeConn{remote: "127.0.0.1:" + string(rune('1'+i))}
 		fl.conns <- c
@@ -93,7 +94,7 @@ func TestPerIPRealListener(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := PerIPLimitListener(inner, 1, nil)
+	l := PerIPLimitListener(inner, 1, nil, nil)
 	defer l.Close()
 	go func() {
 		c, err := net.Dial("tcp", inner.Addr().String())

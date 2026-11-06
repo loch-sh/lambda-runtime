@@ -14,17 +14,23 @@ import (
 
 	"github.com/loch-sh/lambda-runtime/internal/app"
 	"github.com/loch-sh/lambda-runtime/internal/config"
+	"github.com/loch-sh/lambda-runtime/internal/invokecli"
+	"github.com/loch-sh/lambda-runtime/internal/process"
 )
 
 // version is set at build time with -ldflags "-X main.version=…".
 var version = "dev"
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	// First of all, for every subcommand: a non-dumpable process keeps the
+	// function's code (same uid) out of its /proc/<pid>/environ and memory.
+	hardenErr := process.Harden()
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, hardenErr))
 }
 
-// run executes the command line and returns the exit code.
-func run(args []string, stdout, stderr io.Writer) int {
+// run executes the command line and returns the exit code. hardenErr is
+// the result of process.Harden, which main ran first.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer, hardenErr error) int {
 	src := config.DefaultSources()
 	src.Output = stderr
 	cfg, err := config.Parse(args, src)
@@ -40,11 +46,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, version)
 		return 0
 	case config.CommandRun:
-		return app.Run(cfg, app.Env{Stdout: stdout, Stderr: stderr})
+		return app.Run(cfg, app.Env{Stdout: stdout, Stderr: stderr, Version: version, HardenErr: hardenErr})
 	case config.CommandHealth:
 		return app.Health(cfg, stdout)
 	default:
-		fmt.Fprintf(stderr, "loch-lambda-runtime: %s is not implemented yet\n", cfg.Command)
-		return 1
+		return invokecli.Run(cfg, stdin, stdout, stderr)
 	}
 }
