@@ -178,8 +178,65 @@ func TestProvidedAL2023(t *testing.T) {
 			if r.status != 200 || json.Unmarshal(r.body, &out) != nil || out["hello"] != "go" || out["requestId"] == "" {
 				t.Fatalf("go function: %s", r)
 			}
+			r = c.invoke(`{"op":"throw"}`)
+			var fnErr struct{ ErrorType, ErrorMessage string }
+			if r.status != 200 || r.functionError != "Unhandled" || json.Unmarshal(r.body, &fnErr) != nil ||
+				fnErr.ErrorType != "errorString" || fnErr.ErrorMessage != "thrown on purpose" {
+				t.Fatalf("go function error: %s", r)
+			}
 		})
 	}
+}
+
+// TestProvidedBootstrapErrors: what happens to a provided.al2023 function
+// whose bootstrap cannot run. The image's /var/runtime/bootstrap execs
+// /var/task/bootstrap (or /opt/bootstrap) and reports
+// Runtime.InvalidEntrypoint otherwise; the runtime reports it to the
+// invoker as a function error and retries the init with a backoff (the
+// init error answers every invocation, retry or not).
+func TestProvidedBootstrapErrors(t *testing.T) {
+	img := image{"provided", "public.ecr.aws/lambda/provided:al2023", "", "bootstrap"}
+	for name, c := range map[string]struct {
+		code             string
+		errorType, cause string
+	}{
+		"missing":        {codeDir(t, "", 0), "Runtime.InvalidEntrypoint", "no bootstrap found"},
+		"not executable": {codeDir(t, "#!/bin/sh\nexit 0\n", 0o644), "Runtime.InvalidEntrypoint", "failed to exec /var/task/bootstrap"},
+		"exits at init":  {codeDir(t, "#!/bin/sh\nexit 3\n", 0o755), "Runtime.ExitError", "exit status 3"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ct := start(t, img, runOptions{code: c.code})
+			ct.waitHealth("error")
+			r := ct.invoke(`{}`)
+			var out struct{ ErrorType, ErrorMessage string }
+			if r.status != 200 || r.functionError != "Unhandled" || json.Unmarshal(r.body, &out) != nil ||
+				out.ErrorType != c.errorType || !strings.Contains(out.ErrorMessage, c.cause) {
+				t.Fatalf("invoke: %s", r)
+			}
+		})
+	}
+}
+
+// codeDir returns a code directory holding a bootstrap with content and
+// mode (none when content is ""). The directory is 0755: t.TempDir is
+// 0700, which uid 10001 cannot enter.
+func codeDir(t *testing.T, content string, mode os.FileMode) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if content != "" {
+		path := filepath.Join(dir, "bootstrap")
+		if err := os.WriteFile(path, []byte(content), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil { // not filtered by the umask
+			t.Fatal(err)
+		}
+	}
+	return dir
 }
 
 // TestSharpResize is the use case of the spike: an image resized with

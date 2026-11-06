@@ -119,6 +119,24 @@ The Runtime Interface Emulator (RIE) bundled in AWS base images crashes on two o
 - **[aws]** `/tmp`: Lambda gives 512 MB by default, and "download the object to /tmp" is a common pattern; the panel makes the tmpfs size configurable (default 512 MB, documented as counted against the memory limit).
 - **[aws] AWS SDK use**: functions calling AWS-compatible services (Loch S3) get `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from panel secrets and `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` (standard SDK variables), so the code is unchanged; the panel sets `AWS_EC2_METADATA_DISABLED=true` (otherwise the SDK credential chain times out on IMDS). Later: an ECS-style container-credentials endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN`) for rotating keys. Open: S3 virtual-hosted-style addressing does not resolve on Docker DNS; check path-style defaults with Loch S3 in phase 1b.
 
+## Custom runtimes: `provided.al2023` and `bootstrap` (Go, Rust, …)
+
+Measured with the runtime on `public.ecr.aws/lambda/provided:al2023` (arm64, Docker Desktop and a Docker volume for the Linux-only cases) under the hardening (uid 10001, read-only, `cap_drop: ALL`). Items marked ✓ are covered by `integration/compat_test.go` (`TestProvidedAL2023`, `TestProvidedBootstrapErrors`).
+
+- **Command**: as for the other images, `-- /lambda-entrypoint.sh <handler>` (or the shortcut `<handler>`) ✓. The entrypoint script requires exactly one argument and exports it as `_HANDLER`; Go (`aws-lambda-go`) ignores it: any non-empty value works, `bootstrap` by convention. `-- ./bootstrap` (relative to `/var/task`, the working directory) also works, without `_HANDLER` ✓. Without handler nor command, the runtime refuses to start (usage, exit 2).
+- **Name and place**: according to the image's `/var/runtime/bootstrap` script, it execs `/var/task/bootstrap`, else `/opt/bootstrap` (layers), and nothing else. Any executable works: a static binary, or a script (`#!/bin/sh`) that execs one.
+- **Mode**: readable and executable by uid 10001. The files belong to the panel or the developer, not to 10001: `0755` (other `r-x`) ✓, and every directory on the way `o+x`. A root-owned `0700` bootstrap fails with `Permission denied`.
+- **Docker Desktop (macOS)** does not enforce the owner on bind mounts: a `0700` file of the host user runs as uid 10001 there, and fails on Linux. The execute bit is enforced everywhere (a `0644` file fails) ✓.
+- **Panel side (recommendation, not measured)**: a zip made without Unix modes (Windows tools) would extract a non-executable `bootstrap`; set `0755` on it when extracting, or refuse the zip.
+- **Architecture**: the binary must match the image (`GOARCH=arm64` or `amd64`), static (`CGO_ENABLED=0`, `-tags lambda.norpc` with `aws-lambda-go`) or built against the image's glibc (AL2023). A mismatch runs under emulation where `binfmt` handles that architecture (an amd64 bootstrap ran on Docker Desktop arm64), and fails otherwise (`Exec format error`, measured with a loong64 binary). The panel can check the ELF header (`e_machine`) at deploy.
+- **When the bootstrap cannot run**, the causes and what the image's script posts to `/runtime/init/error`:
+  - missing: `Runtime.InvalidEntrypoint`, `no bootstrap found at /var/task/bootstrap or /opt/bootstrap` ✓;
+  - not executable, not readable, wrong architecture without emulation: `Runtime.InvalidEntrypoint`, `failed to exec /var/task/bootstrap` (the reason on stderr) ✓ for the first;
+  - exits during init: `Runtime.ExitError`, `Runtime exited with error: exit status N` (the runtime's error) ✓.
+
+  Then health is `error` (the `health` subcommand exits 1), every invocation answers 200 with `X-Amz-Function-Error: Unhandled` and that error as payload ✓, and the init is retried with the backoff. **[aws]** Lambda also reports init errors as function errors *(exact shape unverified)*.
+- `/var/task` is read-only: the bootstrap writes to `/tmp` only.
+
 ## Threat model: what the function's code can do **[sec]**
 
 The function's code is untrusted and runs under the runtime's uid, in the same container. Besides what the sections above cover (credentials, credential files, the loopback exemption), it can:
