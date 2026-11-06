@@ -1,6 +1,6 @@
 # loch lambda-runtime
 
-![loch.sh Lambda Runtime: a custom runtime for your AWS Lambda functions](docs/cover.png)
+![loch.sh Lambda Runtime: a custom runtime for your Lambda functions](docs/cover.png)
 
 Run AWS Lambda functions in plain Docker containers, with the official AWS
 base images and unchanged handlers. No vendor lock-in: the runtime speaks
