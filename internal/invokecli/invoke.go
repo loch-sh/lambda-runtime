@@ -121,7 +121,11 @@ func readEvent(ctx context.Context, stdin io.Reader, max int64) ([]byte, io.Read
 }
 
 // readFirstJSON reads the first JSON value of stdin as the event, leaving
-// stdin open; the rest of stdin is returned to be watched.
+// stdin open; the rest of stdin is returned to be watched. The event must
+// be followed by a newline (or any whitespace): a number or a literal
+// (42, true, null) only ends at the next byte, and stdin stays open.
+// Objects, arrays and strings end by themselves; a pretty-printed,
+// multi-line event works too.
 func readFirstJSON(ctx context.Context, stdin io.Reader, max int64) ([]byte, io.Reader, error) {
 	dec := json.NewDecoder(io.LimitReader(stdin, max+1))
 	event, err := withStdinTimeout(ctx, func() ([]byte, error) {
@@ -154,7 +158,7 @@ func withStdinTimeout(ctx context.Context, read func() ([]byte, error)) ([]byte,
 	case r := <-done:
 		return r.event, r.err
 	case <-ctx.Done():
-		return nil, errors.New("timed out reading the event on stdin")
+		return nil, errors.New("timed out reading the event on stdin (with --watch-stdin, end it with a newline)")
 	}
 }
 

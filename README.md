@@ -185,8 +185,9 @@ It always ends by its deadline: `--timeout`, by default the function timeout
 \+ `LOCH_RUNTIME_QUEUE_TIMEOUT` + 5 s (the event must arrive on stdin within
 10 s). Docker cannot kill an exec process and does not close its stdout when
 the client goes away, but it closes its stdin: with `--watch-stdin`, the
-event is the first JSON value on stdin, the caller keeps stdin open, and
-`invoke` ends within a second once stdin closes. Exit codes: 0 delivered
+event is the first JSON value on stdin, **ended by a newline** (a number or
+`true`/`null` cannot end otherwise while stdin stays open), the caller
+keeps stdin open, and `invoke` ends within a second once stdin closes. Exit codes: 0 delivered
 (whatever the function returned), 1 transport error or caller gone, 2
 unusable event.
 

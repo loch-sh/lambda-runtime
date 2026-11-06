@@ -66,7 +66,7 @@ func parseFlags(args []string, cmd Command, src Sources) (*parsedFlags, error) {
 		fs.StringVar(&out.timeout, "timeout", "", "deadline of the call (default: function timeout + queue timeout + 5s)")
 		fs.BoolVar(&out.logTail, "log-tail", false, "include the last 4 KB of the invocation logs")
 		fs.BoolVar(&out.watchStdin, "watch-stdin", false,
-			"the event is the first JSON value on stdin; stdin closing afterwards means the caller is gone")
+			"the event is the first JSON value on stdin, ended by a newline; stdin closing afterwards means the caller is gone")
 	}
 	if err := fs.Parse(args); err != nil {
 		return nil, err

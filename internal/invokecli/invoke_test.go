@@ -200,3 +200,28 @@ func TestWatchStdin(t *testing.T) {
 		}
 	}
 }
+
+// TestWatchStdinEveryJSONType: with --watch-stdin, each kind of JSON value,
+// ended by a newline, is read at once while stdin stays open; a number or
+// a literal cannot end before that newline.
+func TestWatchStdinEveryJSONType(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		_, _ = w.Write([]byte(`"ok"`))
+	}))
+	defer srv.Close()
+	cfg := testConfig(srv)
+	cfg.Invoke.WatchStdin = true
+	for _, event := range []string{`{"a":[1,{"b":null}]}`, `[1,"two",3]`, `42`, `-1.5e3`, `"hi"`, `true`, `false`, `null`} {
+		pr, pw := io.Pipe()
+		go func() { _, _ = pw.Write([]byte(event + "\n")) }() // stdin stays open
+		start := time.Now()
+		code := Run(cfg, pr, io.Discard, io.Discard)
+		if code != ExitDelivered || got != event || time.Since(start) > time.Second {
+			t.Errorf("%s: code %d, sent %q, after %s", event, code, got, time.Since(start))
+		}
+		pw.Close()
+	}
+}
