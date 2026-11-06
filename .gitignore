@@ -1,2 +1,5 @@
 dist/
 *.out
+*.key
+*.minisig
+*.bundle
