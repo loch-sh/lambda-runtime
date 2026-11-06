@@ -1,0 +1,24 @@
+# Copyright 2026 The Loch.sh Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Keeps the pinned actions and the test dependencies up to date. The
+# runtime itself has no dependency outside the standard library.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # A fresh release waits a week: time for a compromised one to be caught.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: gomod
+    directory: /integration/testdata/gofunc
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

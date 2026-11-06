@@ -50,8 +50,9 @@ go_build = $(check_version) && $(BUILD_ENV) GOOS=linux GOARCH=$(1) go build -tri
 
 # Release tooling, run in containers pinned by digest (nothing installed),
 # without network for the offline steps. SYFT, COSIGN and MINISIGN can be
-# overridden to run the tools directly (CI jobs using the tool images);
-# TOOL_DIST is then where they see dist/.
+# overridden to run installed tools (the GitHub release job passes the syft
+# of anchore/sbom-action, same version); TOOL_DIST is then where they see
+# dist/.
 SYFT_IMAGE     := docker.io/anchore/syft:v1.57.0@sha256:3c70e6d5979364cefdc22b51617a78fd264574d3bd6b4f84a351204147025e2a
 COSIGN_IMAGE   := ghcr.io/sigstore/cosign/cosign:v3.1.4@sha256:0f06154836d2de34f887a5c273506d52ca43edaa1d9e53e6510fa78a48f69c2d
 MINISIGN_IMAGE := docker.io/jedisct1/minisign@sha256:ee60186c5d05e342e66cbc81133aa744d026752d909d8ea021a15c4d16b1193b

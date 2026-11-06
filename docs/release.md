@@ -77,16 +77,16 @@ repository.
 - Verify: `minisign -Vm SHA256SUMS -P <public key>`, then
   `sha256sum -c --ignore-missing SHA256SUMS` (macOS:
   `shasum -a 256 -c --ignore-missing SHA256SUMS`).
-- Fits any remote (GitHub or GitLab) and offline releases; the trust root is
+- Fits offline releases too; the trust root is
   the published public key, rotated by publishing a new one.
 
 ### `SIGN=cosign`: keyless, from CI
 
-- Release: in CI only, with an OIDC identity token (GitHub Actions
-  `id-token: write`, or GitLab `id_tokens` with `aud: sigstore`) exported as
-  `SIGSTORE_ID_TOKEN`. `make release SIGN=cosign` signs with a short-lived
-  certificate from Fulcio and logs it in Rekor. Output:
-  `SHA256SUMS.cosign.bundle`.
+- Release: in GitHub Actions only (`id-token: write`), when the repository
+  variable `SIGN` is `cosign`: the `release-sign` job signs with a
+  short-lived certificate from Fulcio and logs it in Rekor. Output:
+  `SHA256SUMS.cosign.bundle`. (`make release SIGN=cosign` does the same
+  elsewhere, given an OIDC token in `SIGSTORE_ID_TOKEN`.)
 - Verify:
 
   ```sh
@@ -99,39 +99,74 @@ repository.
   The exact identity binds the signature to the release workflow and tag.
   To accept every release of a line, use one regexp per line, anchored:
   `--certificate-identity-regexp '^https://github\.com/loch-sh/lambda-runtime/\.github/workflows/ci\.yml@refs/tags/v1\.[0-9]+\.[0-9]+$'`.
-  GitLab: identity `https://gitlab.com/<group>/lambda-runtime//.gitlab-ci.yml@refs/tags/v1.0.0`,
-  issuer `https://gitlab.com`, or the URL of a self-hosted GitLab instance.
 - `sha256sum -c SHA256SUMS` checks every file; add `--ignore-missing` only
   when some were not downloaded (one architecture).
 - Keyless signing records the repository identity in the public Rekor log.
 - No key to keep; the trust root is the CI identity (repository and
-  workflow), so it depends on the chosen remote.
+  workflow).
 
 On the Loch.sh Panel side, the trust root is the panel build (an embedded
 table of checksums and the public key or identity), never a bare
 `SHA256SUMS`.
 
+## Build provenance
+
+Every release also carries a GitHub build provenance attestation
+(`actions/attest-build-provenance`, Sigstore-signed, whatever `SIGN` is)
+for each file listed in `SHA256SUMS`: it binds the binary to the workflow,
+the commit and the tag that built it.
+
+```sh
+gh attestation verify loch-lambda-runtime-linux-arm64 --repo loch-sh/lambda-runtime
+```
+
 ## CI
 
-Drafts, not active until a remote is chosen:
+GitHub Actions, `.github/workflows/ci.yml`. Actions are pinned by commit
+(the comment gives the version) and kept up to date by Dependabot
+(`.github/dependabot.yml`, weekly, grouped); runners are pinned by version
+(`ubuntu-26.04`, `ubuntu-26.04-arm`). Default permissions: `contents: read`;
+a new push cancels the previous run of a branch or pull request, never of a
+tag.
 
-- GitHub Actions: `.github/workflows/ci.yml` (runners pinned to
-  `ubuntu-24.04`): vet, unit tests with `-race`, coverage, reproducibility;
-  integration (Docker) on pushes and same-repository pull requests, never
-  on forks; on `vX.Y.Z` tags, three jobs, each with one permission:
-  `release-build` (read; the tag is validated in bash, then by make, which
-  never expands it; no Go cache), `release-sign` (OIDC token only, in the
-  `release` environment: add required reviewers; cosign keyless when the
-  variable `SIGN` is `cosign`), `release-publish` (write; checks
-  `SHA256SUMS`, and the signature when `REQUIRE_SIGNATURE` is 1, the
-  default).
-- GitLab CI: `.gitlab-ci.yml`: same tests; integration on a shell runner
-  with Docker (tag `docker-host`), for protected refs only: Docker access
-  is root on that host, so the runner must be dedicated or ephemeral and
-  locked to protected refs, never run merge request code. On tags (assumed
-  protected, with `SIGN` and `REQUIRE_SIGNATURE` as protected variables),
-  build, SBOM and signature are separate jobs running the pinned tool
-  images directly (their debug/dev variants, which have a shell;
-  Docker-in-Docker could not see the job's files); the signature job checks
-  `SHA256SUMS` first. Release artifacts are kept (`expire_in: never`);
-  creating a GitLab Release is left to the maintainers.
+- `test`: gofmt, vet, unit tests with `-race`, coverage, on amd64 and arm64.
+- `reproducible`: the release recipe twice, same sha256.
+- `integration`: the AWS images under Docker, on amd64 and arm64; on pushes
+  and same-repository pull requests, never on forks (it starts containers).
+- On `vX.Y.Z[-suffix]` tags, three jobs, each with what it needs only:
+  - `release-build` (read): the tag is validated in bash, then by make,
+    which never expands it; no Go cache; syft from `anchore/sbom-action`
+    (pinned syft version) for the SBOMs; uploads `dist/`;
+  - `release-sign` (OIDC token, in the `release` environment: add required
+    reviewers): checks `SHA256SUMS`, attests the build provenance, and signs
+    `SHA256SUMS` with cosign (`sigstore/cosign-installer`, pinned cosign
+    version) when the variable `SIGN` is `cosign`;
+  - `release-publish` (write, `release` environment): checks `SHA256SUMS`
+    and, when `REQUIRE_SIGNATURE` is 1 (the default), the signature, then
+    creates the GitHub release (`softprops/action-gh-release`; a tag with a
+    `-suffix` is a prerelease).
+
+`release-build` also refuses a tag whose commit is not on `main`, a `SIGN`
+other than `none` or `cosign` (minisign needs the maintainer's key, never in
+CI), and `SIGN=none` with `REQUIRE_SIGNATURE=1`: tags fail at once until
+the signature is set up. `release-publish` publishes exactly the files of
+`SHA256SUMS` (plus the bundle), and verifies the cosign signature against
+this workflow's identity for this tag.
+
+**Prerequisites, before the first tag** (repository settings: without
+them, anyone with write access could release from any commit):
+
+- a ruleset protecting the `v*` tags (creation by maintainers only);
+- the `release` environment, with required reviewers and a deployment
+  policy limited to `v*` tags (`release-sign` and `release-publish` both
+  use it: two approvals per release);
+- the repository variables `SIGN` (`cosign`) and `REQUIRE_SIGNATURE` (`1`);
+- a public repository (build provenance attestations need it, or GitHub
+  Enterprise).
+
+Dependabot updates the actions after a cooldown of 7 days. The versions
+pinned by hand are updated by hand: `go.mod` and `GOTOOLCHAIN` (Makefile),
+`syft-version` and `cosign-release` (ci.yml), the tool images (Makefile,
+pinned by digest). `download-syft` checks syft against the checksums of
+its own release, a weaker anchor than the digest-pinned image `make sbom`
+uses locally.
