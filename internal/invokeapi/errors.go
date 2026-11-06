@@ -78,3 +78,9 @@ func errInvalidParameter(message string) *awsError {
 func errInvalidContent(message string) *awsError {
 	return &awsError{status: http.StatusBadRequest, name: "InvalidRequestContentException", message: message}
 }
+
+// errBodyTimeout answers a body that did not arrive in time.
+func errBodyTimeout() *awsError {
+	return &awsError{status: http.StatusRequestTimeout, name: "RequestTimeoutException",
+		message: "The request body was not received in time"}
+}

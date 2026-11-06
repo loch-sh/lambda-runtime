@@ -78,45 +78,45 @@ func parseSigV4(header string) (*sigV4Auth, error) {
 // verifySigV4 checks a SigV4 request. When the payload hash is in the
 // X-Amz-Content-Sha256 header, the signature is verified now and the body
 // is later checked against that hash; otherwise the signature, which
-// covers the body, is verified once the body is read.
+// covers the body, is verified once the body is read (Pending).
 func verifySigV4(r *http.Request, header string, c *Credentials, now time.Time) (BodyCheck, error) {
 	a, err := parseSigV4(header)
 	if err != nil {
-		return nil, err
+		return BodyCheck{}, err
 	}
 	if !sameSecret(a.accessKeyID, c.AccessKeyID) {
-		return nil, errBadToken
+		return BodyCheck{}, errBadToken
 	}
 	if err := checkSignedHeaders(r, a.signedHeaders); err != nil {
-		return nil, err
+		return BodyCheck{}, err
 	}
 	t, err := requestTime(r, a)
 	if err != nil {
-		return nil, err
+		return BodyCheck{}, err
 	}
 	amzDate := t.UTC().Format(amzDateLayout)
 	if !strings.HasPrefix(amzDate, a.date) {
-		return nil, errMalformed("The request date does not match the credential scope.")
+		return BodyCheck{}, errMalformed("The request date does not match the credential scope.")
 	}
 	if d := now.Sub(t); d > maxSkew || d < -maxSkew {
-		return nil, errExpired()
+		return BodyCheck{}, errExpired()
 	}
 	signer := &requestSigner{auth: a, request: r, amzDate: amzDate, secret: c.SecretAccessKey}
 	switch hash := r.Header.Get("X-Amz-Content-Sha256"); hash {
 	case unsignedPayload:
-		return nil, errMalformed("UNSIGNED-PAYLOAD is not accepted: sign the payload.")
+		return BodyCheck{}, errMalformed("UNSIGNED-PAYLOAD is not accepted: sign the payload.")
 	case "":
-		return func(body []byte) error { return signer.verify(sha256Hex(body)) }, nil
+		return BodyCheck{Verify: func(body []byte) error { return signer.verify(sha256Hex(body)) }, Pending: true}, nil
 	default:
 		if err := signer.verify(hash); err != nil {
-			return nil, err
+			return BodyCheck{}, err
 		}
-		return func(body []byte) error {
+		return BodyCheck{Verify: func(body []byte) error {
 			if !hmac.Equal([]byte(sha256Hex(body)), []byte(strings.ToLower(hash))) {
 				return errBadSignature
 			}
 			return nil
-		}, nil
+		}}, nil
 	}
 }
 

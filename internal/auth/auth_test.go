@@ -91,11 +91,16 @@ func TestSigV4Valid(t *testing.T) {
 		if err != nil {
 			t.Fatalf("hash header %v: %v", hashHeader, err)
 		}
-		if err := check([]byte(`{"a":1}`)); err != nil {
+		// With the hash header, the signature is verified at once: only
+		// the integrity of the body is left.
+		if wantPending := !hashHeader; check.Pending != wantPending {
+			t.Errorf("hash header %v: pending = %v", hashHeader, check.Pending)
+		}
+		if err := check.Check([]byte(`{"a":1}`)); err != nil {
 			t.Errorf("hash header %v: body check: %v", hashHeader, err)
 		}
 		// A different body fails the check.
-		wantAuthError(t, check([]byte(`{"a":2}`)), 403, "InvalidSignatureException")
+		wantAuthError(t, check.Check([]byte(`{"a":2}`)), 403, "InvalidSignatureException")
 	}
 }
 
@@ -115,7 +120,7 @@ func TestSigV4Failures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAuthError(t, check([]byte(`{}`)), 403, "InvalidSignatureException")
+	wantAuthError(t, check.Check([]byte(`{}`)), 403, "InvalidSignatureException")
 	r = signedRequest(`{}`, testKeyID, "wrong", testNow, true)
 	_, err = a.Authenticate(r)
 	wantAuthError(t, err, 403, "InvalidSignatureException")
@@ -184,7 +189,7 @@ func TestSigV4WithDateHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := check([]byte(`{}`)); err != nil {
+	if err := check.Check([]byte(`{}`)); err != nil {
 		t.Errorf("body check: %v", err)
 	}
 }
@@ -209,11 +214,15 @@ func TestBearer(t *testing.T) {
 		wantAuthError(t, err, 401, "MissingAuthenticationTokenException")
 	}
 	r.Header.Set("Authorization", "Bearer "+testToken)
-	if check, err := a.Authenticate(r); err != nil || check != nil {
+	check, err := a.Authenticate(r)
+	if err != nil {
 		t.Errorf("valid token: %v", err)
 	}
+	if check.Verify != nil || check.Pending {
+		t.Errorf("valid token: body check left: %+v", check)
+	}
 	r.Header.Set("Authorization", "Bearer "+testToken+"x")
-	_, err := a.Authenticate(r)
+	_, err = a.Authenticate(r)
 	wantAuthError(t, err, 403, "UnrecognizedClientException")
 	r.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
 	_, err = a.Authenticate(r)
@@ -316,7 +325,7 @@ func TestUnsignedAmzHeadersRefused(t *testing.T) {
 	r.Header.Set("Content-Type", "application/json")
 	Sign(r, []byte(`{}`), testKeyID, testSecret, "eu-west-3", testNow)
 	check, err := a.Authenticate(r)
-	if err != nil || check([]byte(`{}`)) != nil {
+	if err != nil || check.Check([]byte(`{}`)) != nil {
 		t.Errorf("signed headers: %v", err)
 	}
 	// The unsigned content hash header is refused too.

@@ -10,9 +10,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"github.com/loch-sh/lambda-runtime/internal/auth"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -21,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/loch-sh/lambda-runtime/internal/auth"
 	"github.com/loch-sh/lambda-runtime/internal/engine"
 	"github.com/loch-sh/lambda-runtime/internal/queue"
 )
@@ -72,6 +74,41 @@ func newFixture(t *testing.T, opts Options, serve func(*engine.Job)) *fixture {
 func echo(job *engine.Job) {
 	engine.Finish(job, &engine.Result{Kind: engine.KindSuccess, Payload: job.Payload, ContentType: "application/json",
 		LogTail: []byte("START\nEND\n")})
+}
+
+// waitFor waits up to 5 s for cond.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not reached")
+		}
+	}
+}
+
+// dialHeaderOnly sends the headers of a POST announcing a body of length
+// bytes, and never sends the body.
+func dialHeaderOnly(t *testing.T, f *fixture, path string, length int) net.Conn {
+	t.Helper()
+	c, err := net.Dial("tcp", strings.TrimPrefix(f.srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	fmt.Fprintf(c, "POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", path, length)
+	return c
+}
+
+// readResponse reads the response on c, waiting at most d.
+func readResponse(t *testing.T, c net.Conn, d time.Duration) (*http.Response, []byte, error) {
+	t.Helper()
+	_ = c.SetReadDeadline(time.Now().Add(d))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	b, _ := io.ReadAll(resp.Body)
+	return resp, b, nil
 }
 
 func (f *fixture) do(method, path, body string, header http.Header) (*http.Response, []byte) {
@@ -341,7 +378,7 @@ func TestClientGoneWhileQueued(t *testing.T) {
 type denyAll struct{}
 
 func (denyAll) Authenticate(*http.Request) (auth.BodyCheck, error) {
-	return nil, &auth.Error{Status: 401, Name: "MissingAuthenticationTokenException", Message: "no"}
+	return auth.BodyCheck{}, &auth.Error{Status: 401, Name: "MissingAuthenticationTokenException", Message: "no"}
 }
 
 func TestAuthenticatorRunsFirst(t *testing.T) {
@@ -352,7 +389,9 @@ func TestAuthenticatorRunsFirst(t *testing.T) {
 
 type brokenAuth struct{}
 
-func (brokenAuth) Authenticate(*http.Request) (auth.BodyCheck, error) { return nil, errors.New("bug") }
+func (brokenAuth) Authenticate(*http.Request) (auth.BodyCheck, error) {
+	return auth.BodyCheck{}, errors.New("bug")
+}
 
 func TestUnexpectedErrorIs500(t *testing.T) {
 	f := newFixture(t, Options{Auth: brokenAuth{}}, echo)
@@ -552,16 +591,38 @@ func TestEmptyTailOmitted(t *testing.T) {
 	}
 }
 
-// bodyAuth accepts the request, then refuses bodies other than "good".
+// bodyAuth authenticates the request with its body, like SigV4 without a
+// payload hash header: it refuses bodies other than "good".
 type bodyAuth struct{}
 
 func (bodyAuth) Authenticate(*http.Request) (auth.BodyCheck, error) {
-	return func(body []byte) error {
-		if string(body) != "good" {
-			return &auth.Error{Status: 403, Name: "InvalidSignatureException", Message: "bad"}
-		}
-		return nil
-	}, nil
+	return auth.BodyCheck{Verify: checkGood, Pending: true}, nil
+}
+
+func checkGood(body []byte) error {
+	if string(body) != "good" {
+		return &auth.Error{Status: 403, Name: "InvalidSignatureException", Message: "bad"}
+	}
+	return nil
+}
+
+// hashAuth authenticates the request at once and checks the integrity of
+// its body, like SigV4 with a payload hash header.
+type hashAuth struct{}
+
+func (hashAuth) Authenticate(*http.Request) (auth.BodyCheck, error) {
+	return auth.BodyCheck{Verify: checkGood}, nil
+}
+
+// modeAuth authenticates like SigV4 with a payload hash header when the
+// request carries X-Hash, and like SigV4 without it otherwise.
+type modeAuth struct{}
+
+func (modeAuth) Authenticate(r *http.Request) (auth.BodyCheck, error) {
+	if r.Header.Get("X-Hash") != "" {
+		return hashAuth{}.Authenticate(r)
+	}
+	return bodyAuth{}.Authenticate(r)
 }
 
 func TestBodyCheck(t *testing.T) {
@@ -697,7 +758,7 @@ func TestLoopbackWithoutAuth(t *testing.T) {
 
 func TestUnverifiedBodiesUseTheirOwnBudget(t *testing.T) {
 	q := queue.New(10, 1<<20)
-	q.SetUnverifiedLimits(queue.UnverifiedLimits{Bytes: 100, PerIP: 100})
+	q.SetUnverifiedLimits(queue.UnverifiedLimits{Bytes: 100, PerIP: 100, Count: 10, CountPerIP: 10})
 	f := newFixture(t, Options{Auth: bodyAuth{}, Queue: q}, echo)
 	// Larger than the unverified budget: refused before reading.
 	resp, body := f.do("POST", invokePath, strings.Repeat("x", 200), nil)
@@ -709,10 +770,124 @@ func TestUnverifiedBodiesUseTheirOwnBudget(t *testing.T) {
 	if got := q.UnverifiedBytes(); got != 0 {
 		t.Errorf("unverified bytes left: %d", got)
 	}
+}
+
+func TestRemoteIP(t *testing.T) {
 	if got := remoteIP("[::ffff:10.0.0.1]:5"); got != "10.0.0.1" {
 		t.Errorf("remoteIP = %s", got)
 	}
 	if got := remoteIP("garbage"); got != "garbage" {
 		t.Errorf("remoteIP = %s", got)
+	}
+}
+
+// TestUnverifiedBodiesNeverSent: requests that pass the checks done before
+// the body (a valid access key id), then never send it, take no queue
+// slot, are capped in number, and get 408 once their deadline passes.
+func TestUnverifiedBodiesNeverSent(t *testing.T) {
+	q := queue.New(2, 1<<20)
+	q.SetUnverifiedLimits(queue.UnverifiedLimits{Bytes: 1 << 20, PerIP: 1 << 20, Count: 3, CountPerIP: 3})
+	f := newFixture(t, Options{Auth: modeAuth{}, Queue: q}, echo)
+	stalled := make([]net.Conn, 3)
+	for i := range stalled {
+		stalled[i] = dialHeaderOnly(t, f, invokePath, 1)
+	}
+	waitFor(t, func() bool { return q.UnverifiedCount() == 3 })
+	if s := q.Stats(); s.Depth != 0 {
+		t.Errorf("stalled requests hold queue slots: %+v", s)
+	}
+	// Beyond the count cap: refused at once.
+	resp, body := f.do("POST", invokePath, "good", nil)
+	wantAWSError(t, resp, body, 429, "TooManyRequestsException")
+	// A caller authenticated before its body (payload hash header) is served.
+	if resp, _ := f.do("POST", invokePath, "good", http.Header{"X-Hash": {"1"}}); resp.StatusCode != 200 {
+		t.Errorf("authenticated caller: %d", resp.StatusCode)
+	}
+	// The stalled requests time out with 408, closed, and give their room
+	// back.
+	for _, c := range stalled {
+		resp, b, err := readResponse(t, c, bodyGrace+3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantAWSError(t, resp, b, 408, "RequestTimeoutException")
+		if !resp.Close {
+			t.Error("408 keeps the connection open")
+		}
+	}
+	waitFor(t, func() bool { return q.UnverifiedCount() == 0 && q.Stats().Bytes == 0 })
+}
+
+// TestVerifiedIntoAFullQueue: the slot is taken once the request is
+// verified; a full queue at that moment answers 429 and frees the room.
+func TestVerifiedIntoAFullQueue(t *testing.T) {
+	q := queue.New(1, 1<<20)
+	f := newFixture(t, Options{Auth: bodyAuth{}, Queue: q}, nil)
+	held, err := q.Reserve(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+	resp, body := f.do("POST", invokePath, "good", nil)
+	wantAWSError(t, resp, body, 429, "TooManyRequestsException")
+	if s := q.Stats(); s.Depth != 1 || s.Bytes != 1 || q.UnverifiedCount() != 0 {
+		t.Errorf("room kept: %+v", s)
+	}
+}
+
+// TestStalledUnverifiedCannotStarveTheQueue reproduces an attack: 16 SigV4
+// requests from one IP, with a valid access key id (it travels in clear)
+// but no payload hash header, announce a 1-byte body and never send it.
+// They used to take the 16 slots of the queue, and every legitimate caller
+// got 429. With the limits of the runtime (a quarter of the queue size, a
+// quarter of that per IP), one is held, the others are refused at once,
+// and the queue stays free.
+func TestStalledUnverifiedCannotStarveTheQueue(t *testing.T) {
+	const queueSize = 16
+	q := queue.New(queueSize, 32<<20)
+	q.SetUnverifiedLimits(queue.UnverifiedLimits{Bytes: 8 << 20, PerIP: 6 << 20, Count: queueSize / 4, CountPerIP: 1})
+	f := newFixture(t, Options{Auth: modeAuth{}, Queue: q, MaxInFlightPerIP: queueSize + 1}, echo)
+	dialHeaderOnly(t, f, invokePath, 1) // held until the end of the test
+	waitFor(t, func() bool { return q.UnverifiedCount() == 1 })
+	for range queueSize - 1 {
+		resp, b, err := readResponse(t, dialHeaderOnly(t, f, invokePath, 1), 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantAWSError(t, resp, b, 429, "TooManyRequestsException")
+	}
+	if s := q.Stats(); s.Depth != 0 || q.UnverifiedCount() != 1 {
+		t.Errorf("stalled requests hold room: %+v, %d unverified", s, q.UnverifiedCount())
+	}
+	for range queueSize {
+		if resp, _ := f.do("POST", invokePath, "good", http.Header{"X-Hash": {"1"}}); resp.StatusCode != 200 {
+			t.Fatalf("legitimate caller: %d", resp.StatusCode)
+		}
+	}
+}
+
+// TestEarlyErrorsDoNotWaitForTheBody: an error answered before the body is
+// read (404, 413) comes at once and closes the connection; net/http would
+// otherwise wait for the announced body first.
+func TestEarlyErrorsDoNotWaitForTheBody(t *testing.T) {
+	f := newFixture(t, Options{}, echo)
+	denied := newFixture(t, Options{Auth: denyAll{}}, echo)
+	for _, c := range []struct {
+		f      *fixture
+		path   string
+		length int
+		want   int
+	}{
+		{f, "/2015-03-31/functions/other/invocations", 10, 404},
+		{f, invokePath, 1 << 20, 413},
+		{denied, invokePath, 10, 401},
+	} {
+		resp, _, err := readResponse(t, dialHeaderOnly(t, c.f, c.path, c.length), 2*time.Second)
+		if err != nil {
+			t.Fatalf("%d: %v", c.want, err)
+		}
+		if resp.StatusCode != c.want || !resp.Close {
+			t.Errorf("%d: got %d close=%v", c.want, resp.StatusCode, resp.Close)
+		}
 	}
 }

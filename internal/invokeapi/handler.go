@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/loch-sh/lambda-runtime/internal/auth"
@@ -22,8 +23,8 @@ import (
 )
 
 // Authenticator checks the credential of a request before its body is
-// read. It returns the error to answer, or nil and the check that still
-// needs the body (nil when none).
+// read. It returns the error to answer, or nil and what is left to check
+// once the body is read.
 type Authenticator interface {
 	Authenticate(r *http.Request) (auth.BodyCheck, error)
 }
@@ -92,7 +93,7 @@ const (
 	// maxRetryAfter bounds the advertised Retry-After, in seconds.
 	maxRetryAfter = 30
 	// unverifiedBodyRate is the minimum upload rate of a request not
-	// authenticated yet: 6 MiB within 5 s + 1.5 s.
+	// authenticated yet: 6 MiB within 5 s + 1.5 s, else 408.
 	unverifiedBodyRate = 4 << 20
 	// defaultMinBodyRate applies when Options.MinBodyRate is unset.
 	defaultMinBodyRate = 1 << 20
@@ -202,13 +203,14 @@ func (h *Handler) run(w http.ResponseWriter, r *http.Request, job *engine.Job, b
 //
 // A request whose authentication needs the body (SigV4 without a payload
 // hash header) is not authenticated yet: its reservation comes from the
-// smaller unverified budget, and its body must arrive faster.
+// smaller unverified budget, without a queue slot until it is verified,
+// and its body must arrive faster.
 func (h *Handler) receive(w http.ResponseWriter, r *http.Request, bodyCheck auth.BodyCheck) ([]byte, *queue.Reservation, error) {
 	reserve := r.ContentLength
 	if reserve < 0 {
 		reserve = h.opts.MaxPayload
 	}
-	unverified := bodyCheck != nil
+	unverified := bodyCheck.Pending
 	rate := h.opts.MinBodyRate
 	var res *queue.Reservation
 	var err error
@@ -218,23 +220,30 @@ func (h *Handler) receive(w http.ResponseWriter, r *http.Request, bodyCheck auth
 	} else {
 		res, err = h.opts.Queue.Reserve(reserve)
 	}
-	switch {
-	case errors.Is(err, queue.ErrFull):
-		return nil, nil, h.throttled()
-	case err != nil:
-		return nil, nil, errShuttingDown()
+	if err != nil {
+		return nil, nil, h.queueError(err)
 	}
 	body, err := h.readBody(w, r, reserve, rate)
-	if err == nil && unverified {
-		err = bodyCheck(body)
+	if err == nil {
+		err = bodyCheck.Check(body)
 	}
 	if err != nil {
 		res.Release()
 		return nil, nil, err
 	}
-	res.Verified()
+	if err := res.Verified(); err != nil { // the reservation is released
+		return nil, nil, h.queueError(err)
+	}
 	res.Shrink(int64(len(body)))
 	return body, res, nil
+}
+
+// queueError is the answer to a refused reservation.
+func (h *Handler) queueError(err error) error {
+	if errors.Is(err, queue.ErrFull) {
+		return h.throttled()
+	}
+	return errShuttingDown()
 }
 
 // dryRun answers a DryRun invocation: 204 once the request is fully
@@ -257,7 +266,6 @@ func (h *Handler) dryRun(w http.ResponseWriter, r *http.Request, id string, body
 // slow sender cannot hold a queue reservation for long.
 func (h *Handler) readBody(w http.ResponseWriter, r *http.Request, size, rate int64) ([]byte, error) {
 	rc := http.NewResponseController(w)
-	defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
 	body := &progressReader{
 		r:    http.MaxBytesReader(w, r.Body, h.opts.MaxPayload),
 		rc:   rc,
@@ -271,10 +279,19 @@ func (h *Handler) readBody(w http.ResponseWriter, r *http.Request, size, rate in
 	} else {
 		data, err = readChunked(body, h.opts.MaxPayload)
 	}
+	if err != nil {
+		// Keep the deadline expired: fail closes the connection, and
+		// net/http must not wait for the rest of the body meanwhile.
+		_ = rc.SetReadDeadline(time.Now())
+	} else {
+		_ = rc.SetReadDeadline(time.Time{})
+	}
 	var tooLarge *http.MaxBytesError
 	switch {
 	case errors.As(err, &tooLarge):
 		return nil, errTooLarge(h.opts.MaxPayload)
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return nil, errBodyTimeout()
 	case err != nil:
 		return nil, errInvalidContent("The request body could not be read")
 	}
@@ -391,7 +408,7 @@ func (h *Handler) admit(w http.ResponseWriter, r *http.Request, id string) (rele
 // or for an exempt loopback caller (Options.LoopbackWithoutAuth).
 func (h *Handler) authenticate(r *http.Request) (auth.BodyCheck, error) {
 	if h.opts.Auth == nil || (h.opts.LoopbackWithoutAuth && isLoopback(r.RemoteAddr)) {
-		return nil, nil
+		return auth.BodyCheck{}, nil
 	}
 	return h.opts.Auth.Authenticate(r)
 }
@@ -399,7 +416,13 @@ func (h *Handler) authenticate(r *http.Request) (auth.BodyCheck, error) {
 // fail answers err in the AWS shape. An authentication failure also
 // closes the connection, is counted, and is logged at most once a minute
 // per source IP.
+//
+// A request with a body closes the connection too: the body may be unread,
+// and net/http would wait for it before answering, with no deadline.
 func (h *Handler) fail(w http.ResponseWriter, r *http.Request, id string, err error) {
+	if r.ContentLength != 0 {
+		w.Header().Set("Connection", "close")
+	}
 	aerr, isAuth := asAWSError(err)
 	switch {
 	case isAuth:
@@ -472,8 +495,8 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	check, err := h.authenticate(r)
-	if err == nil && check != nil {
-		err = check(nil) // a GET has no body
+	if err == nil {
+		err = check.Check(nil) // a GET has no body
 	}
 	if err != nil {
 		h.fail(w, r, id, err)

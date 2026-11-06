@@ -6,9 +6,11 @@
 // AWS SDKs pointed at the runtime with endpoint-url work unchanged.
 //
 // Every check that does not need the body runs before it is read. A SigV4
-// signature covers the payload hash, which the AWS SDKs for Lambda do not
-// send in a header: the signature itself is then verified once the body is
-// read, with BodyCheck.
+// signature covers the payload hash. When the hash is in the
+// X-Amz-Content-Sha256 header, the signature is verified at once and the
+// body is only checked against the hash. The AWS SDKs for Lambda do not send
+// that header: the signature itself is then verified once the body is read,
+// and the caller is not authenticated until then (BodyCheck.Pending).
 package auth
 
 import (
@@ -43,8 +45,24 @@ func errExpired() *Error {
 	return &Error{http.StatusForbidden, "InvalidSignatureException", "Signature expired: the request time is more than 5 minutes away from the server time."}
 }
 
-// BodyCheck verifies what needs the body; nil when nothing is left to check.
-type BodyCheck func(body []byte) error
+// BodyCheck is what remains to check once the body is read. The zero value
+// checks nothing.
+type BodyCheck struct {
+	// Verify checks the body; nil when nothing is left to check.
+	Verify func(body []byte) error
+	// Pending reports that the caller is not authenticated until Verify
+	// passes (it checks the signature). Otherwise the caller is
+	// authenticated already, and Verify only checks the body's integrity.
+	Pending bool
+}
+
+// Check runs Verify, if any, on body.
+func (c BodyCheck) Check(body []byte) error {
+	if c.Verify == nil {
+		return nil
+	}
+	return c.Verify(body)
+}
 
 // Authenticator checks requests against the configured credentials.
 type Authenticator struct {
@@ -63,15 +81,15 @@ func (a *Authenticator) Authenticate(r *http.Request) (BodyCheck, error) {
 	header := r.Header.Get("Authorization")
 	switch {
 	case header == "":
-		return nil, errMissing
+		return BodyCheck{}, errMissing
 	case strings.HasPrefix(header, "Bearer "):
-		return nil, checkBearer(c, strings.TrimPrefix(header, "Bearer "))
+		return BodyCheck{}, checkBearer(c, strings.TrimPrefix(header, "Bearer "))
 	case strings.HasPrefix(header, sigV4Algorithm+" "):
 		if c.AccessKeyID == "" {
-			return nil, errBadToken
+			return BodyCheck{}, errBadToken
 		}
 		return verifySigV4(r, header, c, a.now())
 	default:
-		return nil, errMalformed("Unsupported Authorization header: use a bearer token or AWS4-HMAC-SHA256.")
+		return BodyCheck{}, errMalformed("Unsupported Authorization header: use a bearer token or AWS4-HMAC-SHA256.")
 	}
 }

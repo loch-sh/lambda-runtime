@@ -6,7 +6,8 @@
 // body is read, so that a flood of requests is refused without being
 // buffered: the bodies live in the function's own memory.
 //
-// The count covers the waiting requests (being read or queued). The bytes
+// The count covers the waiting requests (being read or queued), except the
+// unverified ones, which have their own caps (see unverified.go). The bytes
 // cover every body in memory: waiting, popped but not started, and running;
 // they are released when the job gets its outcome.
 package queue
@@ -28,6 +29,9 @@ var (
 	// ErrClosed: the runtime is shutting down. It wraps
 	// engine.ErrSourceClosed, so that the engine stops popping.
 	ErrClosed = fmt.Errorf("queue: closed: %w", engine.ErrSourceClosed)
+	// ErrNotVerified: an unverified reservation cannot be enqueued; call
+	// Verified first.
+	ErrNotVerified = errors.New("queue: reservation not verified")
 )
 
 // Queue implements engine.Source.
@@ -37,7 +41,7 @@ type Queue struct {
 
 	mu     sync.Mutex
 	items  *list.List // of *Entry, front first
-	count  int        // waiting requests: reservations and queued entries
+	count  int        // waiting requests: verified reservations and queued entries
 	bytes  int64      // bytes of every body not finished yet
 	peak   int        // highest count seen
 	closed bool
@@ -53,7 +57,10 @@ type Queue struct {
 func New(maxCount int, maxBytes int64) *Queue {
 	return &Queue{
 		maxCount: maxCount, maxBytes: maxBytes, items: list.New(), ready: make(chan struct{}, 1),
-		unverified: unverifiedBudget{max: maxBytes, perIP: maxBytes, byIP: map[string]int64{}},
+		unverified: unverifiedBudget{
+			UnverifiedLimits: UnverifiedLimits{Bytes: maxBytes, PerIP: maxBytes, Count: maxCount, CountPerIP: maxCount},
+			byIP:             map[string]*ipUsage{},
+		},
 	}
 }
 
@@ -62,10 +69,13 @@ func New(maxCount int, maxBytes int64) *Queue {
 type Reservation struct {
 	q     *Queue
 	bytes int64
-	// slotFreed and bytesFreed record what was given back.
-	slotFreed, bytesFreed bool
-	// unverifiedIP is set while the request is not authenticated yet.
-	unverifiedIP string
+	// slot is set while the reservation holds a slot of the count;
+	// bytesFreed records that its bytes were given back.
+	slot, bytesFreed bool
+	// unverified is set while the request is not authenticated yet; ip is
+	// its source, which the unverified budget accounts.
+	unverified bool
+	ip         string
 }
 
 // Entry is a queued job.
@@ -97,10 +107,16 @@ func (q *Queue) admitLocked(n int64) error {
 }
 
 func (q *Queue) takeLocked(n int64) *Reservation {
-	q.count++
 	q.bytes += n
-	q.peak = max(q.peak, q.count)
-	return &Reservation{q: q, bytes: n}
+	r := &Reservation{q: q, bytes: n}
+	r.takeSlotLocked()
+	return r
+}
+
+func (r *Reservation) takeSlotLocked() {
+	r.slot = true
+	r.q.count++
+	r.q.peak = max(r.q.peak, r.q.count)
 }
 
 // Shrink lowers the reservation to the actual body size once it is read.
@@ -109,7 +125,9 @@ func (r *Reservation) Shrink(n int64) {
 	defer r.q.mu.Unlock()
 	if !r.bytesFreed && n < r.bytes {
 		r.q.bytes -= r.bytes - n
-		r.q.unverified.shrink(r.unverifiedIP, r.bytes-n)
+		if r.unverified {
+			r.q.unverified.shrink(r.ip, r.bytes-n)
+		}
 		r.bytes = n
 	}
 }
@@ -125,12 +143,12 @@ func (r *Reservation) Release() {
 func (r *Reservation) releaseLocked() {
 	r.freeSlotLocked()
 	r.freeBytesLocked()
-	r.verifiedLocked()
+	r.leaveUnverifiedLocked()
 }
 
 func (r *Reservation) freeSlotLocked() {
-	if !r.slotFreed {
-		r.slotFreed = true
+	if r.slot {
+		r.slot = false
 		r.q.count--
 	}
 }
@@ -150,11 +168,15 @@ func (r *Reservation) freeBytes() {
 }
 
 // Enqueue queues job at the back. It fails with ErrClosed if the queue
-// closed since the reservation (the room is then released).
+// closed since the reservation (the room is then released), and with
+// ErrNotVerified for a reservation not verified yet (it has no slot).
 func (r *Reservation) Enqueue(job *engine.Job) (*Entry, error) {
 	q := r.q
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if r.unverified {
+		return nil, ErrNotVerified
+	}
 	if q.closed {
 		r.releaseLocked()
 		return nil, ErrClosed
@@ -234,7 +256,8 @@ func (q *Queue) Close() []*engine.Job {
 
 // Stats is a snapshot of the queue.
 type Stats struct {
-	// Depth counts the waiting requests, being read or queued.
+	// Depth counts the waiting requests, being read or queued, except
+	// those not authenticated yet (see UnverifiedCount).
 	Depth int
 	// Peak is the highest Depth seen.
 	Peak int

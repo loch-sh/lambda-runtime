@@ -110,12 +110,7 @@ func start(cfg *config.Config, env Env, relay *logs.Relay, authenticator invokea
 		return nil, fmt.Errorf("runtime api: %w", err)
 	}
 	p.queue = queue.New(cfg.Runtime.QueueSize, cfg.Runtime.QueueBytes)
-	// Bodies of requests not authenticated yet (SigV4 without a payload
-	// hash header): a quarter of the budget, one maximum body per IP.
-	p.queue.SetUnverifiedLimits(queue.UnverifiedLimits{
-		Bytes: max(cfg.Runtime.QueueBytes/4, cfg.Runtime.MaxPayload),
-		PerIP: cfg.Runtime.MaxPayload,
-	})
+	p.queue.SetUnverifiedLimits(unverifiedLimits(cfg.Runtime))
 	opts := engineOptions(cfg, env, log)
 	if !opts.Memory.Available() {
 		log.Warn("cgroup memory files not readable: no Max Memory Used, no OOM detection")
@@ -252,6 +247,25 @@ func serveInvokeAPI(cfg *config.Config, q *queue.Queue, eng *engine.Engine, auth
 	health = invokeapi.NewServer(healthMux, log)
 	go serve(health, netutil.LimitListener(healthLn, healthConns), log)
 	return invoke, health, nil
+}
+
+// unverifiedLimits bound the requests not authenticated yet (SigV4 without
+// a payload hash header): a quarter of the byte budget, at least one
+// maximum body, and one maximum body per IP; a quarter of the queue size,
+// at least one, and a quarter of that per IP (clients behind a NAT or a
+// proxy share an IP).
+func unverifiedLimits(rt config.Runtime) queue.UnverifiedLimits {
+	const (
+		share   = 4 // of the queue (bytes and count) left to unverified requests
+		ipShare = 4 // of the unverified count left to one IP
+	)
+	count := max(1, rt.QueueSize/share)
+	return queue.UnverifiedLimits{
+		Bytes:      max(rt.QueueBytes/share, rt.MaxPayload),
+		PerIP:      rt.MaxPayload,
+		Count:      count,
+		CountPerIP: max(1, count/ipShare),
+	}
 }
 
 // connsPerIP caps the open Invoke API connections of one source IP
