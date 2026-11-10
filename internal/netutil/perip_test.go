@@ -170,10 +170,42 @@ func TestPerIPRefusalLingeringBounded(t *testing.T) {
 	}
 	start := time.Now()
 	l.refuse(server)
-	if _, err := server.Write([]byte("x")); err == nil {
-		t.Error("the refused connection is still open")
+	_ = server.SetReadDeadline(time.Now().Add(time.Second)) // fails on an open conn
+	if _, err := server.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("the refused connection is not closed: %v", err)
 	}
 	if time.Since(start) > refuseLinger/2 {
 		t.Error("the refusal waited although no lingering slot was free")
+	}
+}
+
+// TestPerIPRefusalLingerEnds: a client that neither sends nor closes is
+// dropped after refuseLinger, and its lingering slot is freed.
+func TestPerIPRefusalLingerEnds(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	l := PerIPLimitListener(inner, 1, []byte("no"), nil).(*perIPListener)
+	client, err := net.Dial("tcp", inner.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := inner.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.refuse(server)
+	if len(l.lingering) != 1 {
+		t.Fatalf("lingering = %d, want 1", len(l.lingering))
+	}
+	deadline := time.Now().Add(4 * refuseLinger)
+	for len(l.lingering) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the lingering slot was never freed")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
