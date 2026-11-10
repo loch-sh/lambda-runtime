@@ -4,6 +4,7 @@
 package netutil
 
 import (
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -18,12 +19,25 @@ import (
 // healthcheck), and still bound by the global cap.
 // onRefuse, when not nil, is called for each refused connection (metrics).
 func PerIPLimitListener(l net.Listener, n int, refused []byte, onRefuse func()) net.Listener {
-	return &perIPListener{Listener: l, max: n, refused: refused, onRefuse: onRefuse, open: map[netip.Addr]int{}}
+	return &perIPListener{Listener: l, max: n, refused: refused, onRefuse: onRefuse, open: map[netip.Addr]int{},
+		lingering: make(chan struct{}, maxLingering)}
 }
 
 // refuseWriteTimeout bounds the write of the refusal, which runs in the
 // accept loop.
 const refuseWriteTimeout = 100 * time.Millisecond
+
+// After the refusal, the connection is half-closed and what the client
+// still sends is read and dropped, for refuseLinger and refuseDrainMax
+// bytes at most, before it is closed: closing a socket with unread data
+// sends a RST, which can discard the refusal before the client reads it.
+// At most maxLingering refused connections linger at once; beyond, they
+// are closed at once.
+const (
+	refuseLinger   = 500 * time.Millisecond
+	refuseDrainMax = 256 << 10
+	maxLingering   = 64
+)
 
 type perIPListener struct {
 	net.Listener
@@ -33,6 +47,9 @@ type perIPListener struct {
 
 	mu   sync.Mutex
 	open map[netip.Addr]int
+
+	// lingering holds a token per refused connection being drained.
+	lingering chan struct{}
 }
 
 func (l *perIPListener) Accept() (net.Conn, error) {
@@ -60,7 +77,29 @@ func (l *perIPListener) refuse(c net.Conn) {
 		_ = c.SetWriteDeadline(time.Now().Add(refuseWriteTimeout))
 		_, _ = c.Write(l.refused)
 	}
-	_ = c.Close()
+	l.closeLingering(c)
+}
+
+// closeLingering half-closes c, drains it for a bounded time, then closes
+// it, in its own goroutine (see refuseLinger).
+func (l *perIPListener) closeLingering(c net.Conn) {
+	hc, ok := c.(interface{ CloseWrite() error })
+	if !ok || hc.CloseWrite() != nil {
+		_ = c.Close()
+		return
+	}
+	select {
+	case l.lingering <- struct{}{}:
+	default:
+		_ = c.Close()
+		return
+	}
+	go func() {
+		defer func() { <-l.lingering }()
+		_ = c.SetReadDeadline(time.Now().Add(refuseLinger))
+		_, _ = io.CopyN(io.Discard, c, refuseDrainMax)
+		_ = c.Close()
+	}()
 }
 
 func (l *perIPListener) acquire(ip netip.Addr) bool {

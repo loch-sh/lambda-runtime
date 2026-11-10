@@ -110,3 +110,70 @@ func TestPerIPRealListener(t *testing.T) {
 	_, _ = io.Copy(io.Discard, c)
 	c.Close()
 }
+
+// TestPerIPRefusalSurvivesUnreadRequest: the refusal reaches a client that
+// sent its whole request first. Closing a socket with unread data sends a
+// RST, which can discard the refusal before the client reads it; refuse
+// half-closes and drains instead.
+func TestPerIPRefusalSurvivesUnreadRequest(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	refusal := []byte("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+	l := PerIPLimitListener(inner, 1, refusal, nil).(*perIPListener)
+	for i := range 20 {
+		client, err := net.Dial("tcp", inner.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		server, err := inner.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := make([]byte, 64<<10)
+		if _, err := client.Write(append([]byte("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 65536\r\n\r\n"), body...)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond) // the request is in the server's buffer
+		l.refuse(server)
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		got, err := io.ReadAll(client)
+		client.Close()
+		if err != nil || string(got) != string(refusal) {
+			t.Fatalf("attempt %d: got %q, %v", i, got, err)
+		}
+	}
+}
+
+// TestPerIPRefusalLingeringBounded: beyond maxLingering draining refusals,
+// a refused connection is closed at once.
+func TestPerIPRefusalLingeringBounded(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	l := PerIPLimitListener(inner, 1, []byte("no"), nil).(*perIPListener)
+	for range maxLingering {
+		l.lingering <- struct{}{}
+	}
+	client, err := net.Dial("tcp", inner.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := inner.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	l.refuse(server)
+	if _, err := server.Write([]byte("x")); err == nil {
+		t.Error("the refused connection is still open")
+	}
+	if time.Since(start) > refuseLinger/2 {
+		t.Error("the refusal waited although no lingering slot was free")
+	}
+}
